@@ -5,8 +5,10 @@ D="$(cd "$(dirname "$0")" && pwd)"
 DATA=/media/developer/lgtv-assist
 mkdir -p "$DATA"
 [ -e "$DATA/disabled" ] && exit 0
+# Stub LG's voiceconductor unless something (e.g. Life's Good Without Spying) already did.
+# The marker tells stop.sh that the stub is ours to undo.
 if ! grep -q " /usr/sbin/voiceconductor " /proc/mounts; then
-  mount --bind "$D/voiceconductor-stub" /usr/sbin/voiceconductor
+  mount --bind "$D/voiceconductor-stub" /usr/sbin/voiceconductor && touch /tmp/lgtv-assist.mounted
 fi
 systemctl stop voiceconductor.service 2>/dev/null
 systemctl start voiceinput.service 2>/dev/null

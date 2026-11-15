@@ -5,7 +5,10 @@ var Service = require('webos-service');
 var fs = require('fs'), path = require('path'), cp = require('child_process');
 
 var ID = 'io.github.xrogers.lgtvassist.service';
-var DAEMON = path.join(__dirname, 'daemon');
+var APP_ID = 'io.github.xrogers.lgtvassist';
+// The daemon runs from the app folder: Life's Good Without Spying only honours a claim from a process
+// started out of /media/developer/apps/usr/palm/applications/<app id>/.
+var DAEMON = path.join(__dirname, '..', '..', 'applications', APP_ID, 'daemon');
 var DATA = '/media/developer/lgtv-assist';
 var HOOK = '/var/lib/webosbrew/init.d/60-lgtv-assist';
 var service = new Service(ID);
@@ -34,9 +37,65 @@ function needRoot(message) {
   return true;
 }
 
+
+// ------------------------------------------------------------------ Life's Good Without Spying
+// nospy can stub LG's voice services. We register two exceptions (off until the user turns them on
+// in nospy): keep voiceinput running (it serves the remote mic audio) and claim the voiceconductor
+// name (nospy's stand-in steps aside while our daemon holds it). See nospy-lib.sh "Exceptions".
+var NOSPY = '/media/developer/apps/usr/palm/applications/ooo.lew.lifesgoodwithoutspying';
+var NOSPY_CTL = NOSPY + '/init/nospy-ctl.sh';
+var EXC_DIR = '/var/lib/webosbrew/lifesgoodwithoutspying.exceptions.d';
+var EXC_FILE = EXC_DIR + '/' + APP_ID;
+var EXC_CONTENT = 'keep voiceinput\nclaim com.webos.service.voiceconductor\n';
+var KEY_KEEP = 'exception.' + APP_ID + ':keep:voiceinput';
+var KEY_CLAIM = 'exception.' + APP_ID + ':claim:com.webos.service.voiceconductor';
+var nospyCache = null, nospyAt = 0;
+
+function nospyInstalled() { return fs.existsSync(NOSPY_CTL); }
+
+// Register our exceptions with nospy. We deliberately do NOT run nospy's apply: it would apply every
+// saved nospy setting, even when the user has nospy disabled. nospy lists registered exceptions on its
+// own (it scans EXC_DIR); the user turns them on and applies in nospy's UI.
+function nospyRegister() {
+  if (!nospyInstalled()) return false;
+  var cur = null;
+  try { cur = fs.readFileSync(EXC_FILE, 'utf8'); } catch (e) {}
+  if (cur === EXC_CONTENT) return false;
+  try { fs.mkdirSync(EXC_DIR); } catch (e) {}
+  fs.writeFileSync(EXC_FILE, EXC_CONTENT);
+  nospyAt = 0;
+  return true;
+}
+
+function nospyStatus(cb) {
+  if (!nospyInstalled()) return cb({ installed: false });
+  if (nospyCache && Date.now() - nospyAt < 20000) return cb(nospyCache);
+  cp.execFile('/bin/sh', [NOSPY_CTL, 'status'], { timeout: 15000 }, function (err, out) {
+    var kv = {};
+    String(out || '').split('\n').forEach(function (l) { var i = l.indexOf('='); if (i > 0) kv[l.slice(0, i)] = l.slice(i + 1); });
+    var stubs = parseInt(kv.stubs, 10) || 0;
+    function applied(k) { return (kv['applied.' + k] !== undefined ? kv['applied.' + k] : kv[k]) === 'on'; }
+    nospyCache = {
+      installed: true,
+      registered: fs.existsSync(EXC_FILE),
+      active: stubs > 0,
+      voiceBlocked: applied('voice.stop') && stubs > 0,
+      keep: applied(KEY_KEEP),
+      claim: applied(KEY_CLAIM),
+      savedKeep: kv['saved.' + KEY_KEEP] === 'on',
+      savedClaim: kv['saved.' + KEY_CLAIM] === 'on'
+    };
+    nospyCache.ok = !nospyCache.voiceBlocked || (nospyCache.keep && nospyCache.claim);
+    nospyAt = Date.now();
+    cb(nospyCache);
+  });
+}
+
 service.register('status', function (message) {
   var st = readJson('/tmp/lgtv-assist.status.json', {});
+  nospyStatus(function (ns) {
   message.respond({
+    nospy: ns,
     returnValue: true,
     root: isRoot(),
     enabled: !fs.existsSync(path.join(DATA, 'disabled')),
@@ -46,6 +105,7 @@ service.register('status', function (message) {
     daemon: st,
     log: message.payload && message.payload.log ? tail('/tmp/lgtv-assist.log', message.payload.log) : undefined
   });
+  });
 });
 
 service.register('start', function (message) {
@@ -53,6 +113,7 @@ service.register('start', function (message) {
   try { fs.mkdirSync(DATA); } catch (e) {}
   try { fs.unlinkSync(path.join(DATA, 'disabled')); } catch (e) {}
   try { installHook(); } catch (e) { return message.respond({ returnValue: false, errorText: 'hook: ' + e.message }); }
+  try { nospyRegister(); } catch (e) { /* nospy optional */ }
   // detached: the daemon must outlive this (idle-stopped) service process
   var p = cp.spawn('/bin/sh', [path.join(DAEMON, 'autostart.sh')], { detached: true, stdio: 'ignore' });
   p.unref();
@@ -86,4 +147,11 @@ service.register('setSettings', function (message) {
   var pid = alive('/tmp/lgtv-assist.daemon.pid');
   if (pid) { try { process.kill(pid, 'SIGTERM'); } catch (e) {} }
   message.respond({ returnValue: true, settings: s });
+});
+
+service.register('nospyRegister', function (message) {
+  if (needRoot(message)) return;
+  var changed = false;
+  try { changed = nospyRegister(); } catch (e) { return message.respond({ returnValue: false, errorText: e.message }); }
+  message.respond({ returnValue: true, installed: nospyInstalled(), changed: changed });
 });

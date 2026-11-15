@@ -44,6 +44,20 @@
     else hint = 'Przytrzymaj <b>przycisk mikrofonu</b> na pilocie, powiedz polecenie i puść. Odpowiedź pojawi się w dymku i zostanie odczytana. Komunikaty z Home Assistant (assist_satellite.announce) też są odtwarzane na telewizorze.';
     $('hint').innerHTML = hint;
 
+    // Life's Good Without Spying: our exceptions must be on while it blocks voice services
+    var ns = s.nospy || {}, nsHtml = '';
+    if (ns.installed && ns.voiceBlocked && !ns.ok) {
+      nsHtml = '<b>Life\'s Good Without Spying blokuje usługi głosowe</b>, a bez nich pilot nie przekaże dźwięku. ' +
+        'Otwórz tę aplikację i w sekcji <b>Exceptions</b> włącz <b>„LG TV Assist: voiceinput”</b> oraz ' +
+        '<b>„LG TV Assist: voiceconductor”</b>, a potem zatwierdź zmiany (Update protection).';
+    } else if (ns.installed && !ns.voiceBlocked && !(ns.savedKeep && ns.savedClaim)) {
+      nsHtml = 'Life\'s Good Without Spying: LG TV Assist zgłosił wyjątki (voiceinput, voiceconductor). ' +
+        'Jeśli włączysz blokadę usług głosowych (Voice), włącz też te wyjątki w sekcji <b>Exceptions</b>, żeby aplikacje sobie nie przeszkadzały.';
+    }
+    $('nospy').innerHTML = nsHtml;
+    $('nospy').className = 'card hint nospy' + (nsHtml ? '' : ' hidden');
+    $('b-nospy').className = 'btn' + (ns.installed && nsHtml ? '' : ' hidden');
+
     $('b-elevate').className = 'btn' + (s.root ? ' hidden' : '');
     $('b-toggle').textContent = s.enabled ? 'Wyłącz' : 'Włącz';
     var toasts = !s.settings || s.settings.toasts !== false;
@@ -88,7 +102,12 @@
       var cur = !(state.status && state.status.settings && state.status.settings.toasts === false);
       luna(SVC + 'setSettings', { toasts: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 3500); });
     },
-    log: function () { state.showLog = !state.showLog; refresh(); }
+    log: function () { state.showLog = !state.showLog; refresh(); },
+    nospy: function () {
+      luna('luna://com.webos.applicationManager/launch', { id: 'ooo.lew.lifesgoodwithoutspying' }, function (r) {
+        if (!r.returnValue) msg('Nie udało się otworzyć: ' + (r.errorText || ''));
+      });
+    }
   };
 
   // ---------------- remote navigation

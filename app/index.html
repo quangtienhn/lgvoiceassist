@@ -7,31 +7,36 @@
   :root { --bg:#0e1621; --card:#17212e; --line:#24324a; --txt:#e8eef6; --dim:#8fa3bd; --acc:#03a9f4; --ok:#4caf50; --bad:#ef5350; --warn:#ffb300; }
   * { box-sizing: border-box; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--txt); font-family: "LG Smart UI", "Museo Sans", Arial, sans-serif; overflow:hidden; }
-  .wrap { padding: 56px 96px; height:100%; display:flex; flex-direction:column; }
+  .wrap { padding: 48px 96px; height:100%; display:flex; flex-direction:column; }
   /* Chromium 68 (webOS 5) has no flexbox gap: use margins */
-  .wrap > * { margin-bottom:28px; } .wrap > *:last-child { margin-bottom:0; }
+  .wrap > * { margin-bottom:32px; flex-shrink:0; } .wrap > *:last-child { margin-bottom:0; }
+  .grid { margin-bottom:40px; }
+  #hint, #nospy { margin-top:0; margin-bottom:40px; }
   header { display:flex; align-items:center; }
   header img { margin-right:24px; }
   header img { width:72px; height:72px; }
   header h1 { font-size:52px; margin:0; font-weight:600; }
   header .ver { color:var(--dim); font-size:26px; margin-left:auto; }
   .grid { display:grid; grid-template-columns: 1fr 1fr; gap:24px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:26px 30px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:22px 30px; }
   .k { color:var(--dim); font-size:24px; margin-bottom:8px; }
   .v { font-size:34px; }
   .dot { display:inline-block; width:18px; height:18px; border-radius:50%; margin-right:12px; vertical-align:middle; background:var(--dim); }
   .ok .dot { background:var(--ok); } .bad .dot { background:var(--bad); } .warn .dot { background:var(--warn); }
-  .hint { font-size:26px; color:var(--dim); line-height:1.45; }
+  .hint { font-size:25px; color:var(--dim); line-height:1.4; }
   .hint b { color:var(--txt); }
   .last { font-size:28px; line-height:1.5; }
   .last .who { color:var(--dim); display:inline-block; width:150px; }
-  .buttons { display:flex; flex-wrap:wrap; margin-bottom:12px !important; }
-  .buttons .btn { margin:0 20px 16px 0; }
+  .buttons { display:flex; flex-wrap:wrap; margin-bottom:16px !important; }
+  .buttons .btn { margin:0 36px 20px 0; }
   .btn { font-size:30px; padding:18px 34px; border-radius:14px; background:var(--card); color:var(--txt); border:3px solid var(--line); }
   .btn.focus { border-color:var(--acc); background:#1d3550; transform:scale(1.04); }
   .btn.hidden { display:none; }
-  pre { margin:0; flex:1; min-height:0; overflow:hidden; background:#0a1018; border:1px solid var(--line); border-radius:14px; padding:18px 22px; font-size:20px; color:#a9bdd6; white-space:pre-wrap; }
+  pre { margin:0; flex:1 1 auto; flex-shrink:1; min-height:0; overflow:hidden; background:#0a1018; border:1px solid var(--line); border-radius:14px; padding:18px 22px; font-size:20px; color:#a9bdd6; white-space:pre-wrap; }
   .msg { font-size:26px; color:var(--warn); min-height:34px; }
+  .nospy { border-color:var(--warn); color:var(--txt); }
+  .nospy b { color:var(--warn); }
+  .hidden { display:none !important; }
 </style>
 </head>
 <body>
@@ -51,10 +56,12 @@
     </div>
   </div>
 
+  <div class="card hint nospy hidden" id="nospy"></div>
   <div class="card hint" id="hint"></div>
 
   <div class="buttons" id="buttons">
     <div class="btn" id="b-elevate" data-act="elevate">Nadaj uprawnienia (Homebrew)</div>
+    <div class="btn hidden" id="b-nospy" data-act="nospy">Otwórz Life's Good Without Spying</div>
     <div class="btn" id="b-toggle" data-act="toggle">Wyłącz</div>
     <div class="btn" id="b-restart" data-act="restart">Uruchom ponownie</div>
     <div class="btn" id="b-toasts" data-act="toasts">Dymki: wł.</div>

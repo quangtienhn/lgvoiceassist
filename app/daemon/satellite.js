@@ -15,7 +15,7 @@ var net = require('net'), fs = require('fs'), path = require('path'), os = requi
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.2.1';
+var VERSION = '0.3.0';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 var LOG = '/tmp/lgtv-assist.log';
 var STATUS = '/tmp/lgtv-assist.status.json';
@@ -47,7 +47,7 @@ var NET = netInfo();
 var MAC = NET.mac.toUpperCase();
 
 // ------------------------------------------------------------------ status (for the app UI)
-var status = { version: VERSION, started: new Date().toISOString(), ip: NET.ip, port: CFG.port, name: CFG.name,
+var status = { mic: 'starting', version: VERSION, started: new Date().toISOString(), ip: NET.ip, port: CFG.port, name: CFG.name,
   ha: null, haSince: null, lastSession: null, lastText: null, lastReply: null, lastError: null };
 function saveStatus() { try { fs.writeFileSync(STATUS, JSON.stringify(status)); } catch (e) {} }
 saveStatus();
@@ -70,28 +70,79 @@ function toast(text) {
 
 // ------------------------------------------------------------------ luna: be "voiceconductor"
 var VC = 'com.webos.service.voiceconductor';
+var APP_ID = 'io.github.xrogers.lgtvassist';
 var VC_ANSWERS = { '/': { setInputEvent: {}, getSupportedLanguages: { voiceEngines: {}, voiceLanguages: {} } },
   '/interactor': { register: { subscribed: true } } };
-var handles = [false, true].map(function (pub) {
-  var h = new palmbus.Handle(VC, pub);
-  Object.keys(VC_ANSWERS).forEach(function (cat) {
-    Object.keys(VC_ANSWERS[cat]).forEach(function (m) { h.registerMethod(cat, m); });
-  });
-  h.addListener('request', function (msg) {
-    var body = {}; try { body = JSON.parse(msg.payload() || '{}'); } catch (e) {}
-    var r = JSON.parse(JSON.stringify((VC_ANSWERS[msg.category()] || {})[msg.method()] || {}));
-    r.returnValue = true; msg.respond(JSON.stringify(r));
-    if (msg.method() === 'setInputEvent') {
-      if (body.event === 'down') pttDown(); else if (body.event === 'up') pttUp();
-    }
-  });
-  return h;
-});
-log('lgtv-assist', VERSION, 'registered', VC, 'ip', NET.ip, 'mac', MAC);
+var handles = null;
+
+// Life's Good Without Spying may answer for voiceconductor with its own stand-in. With our "claim"
+// exception turned on, it steps aside for the process named in its claim file (pid, start time, app id;
+// the process must run from our app folder). Without it we don't fight the stand-in.
+var NOSPY_ANSWER_PID = '/tmp/lifesgoodwithoutspying.answer.' + VC + '.pid';
+var NOSPY_CLAIM = '/tmp/lifesgoodwithoutspying.claim.' + VC;
+var NOSPY_APPLIED = '/var/lib/webosbrew/lifesgoodwithoutspying.conf-applied';
+function procStartTime(pid) {
+  var st = fs.readFileSync('/proc/' + pid + '/stat', 'utf8');
+  return st.slice(st.lastIndexOf(')') + 2).split(' ')[19];
+}
+function nospyClaimAllowed() {
+  try {
+    return fs.readFileSync(NOSPY_APPLIED, 'utf8').split('\n')
+      .indexOf('exception.' + APP_ID + ':claim:' + VC + '=on') >= 0;
+  } catch (e) { return false; }
+}
+function nospyStandIn() {
+  try {
+    var pid = parseInt(fs.readFileSync(NOSPY_ANSWER_PID, 'utf8'), 10);
+    return fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8').indexOf('nospy-luna-stub.js') >= 0 ? pid : 0;
+  } catch (e) { return 0; }
+}
+function nospyClaim() {
+  var stand = nospyStandIn();
+  if (!stand) return false;
+  if (!nospyClaimAllowed()) { status.mic = 'blocked by Life\'s Good Without Spying (turn on the LG TV Assist exception)'; saveStatus(); return false; }
+  try { fs.writeFileSync(NOSPY_CLAIM, process.pid + ' ' + procStartTime(process.pid) + ' ' + APP_ID + '\n'); } catch (e) { return false; }
+  try { process.kill(stand, 'SIGTERM'); } catch (e) {}
+  log('nospy: claimed', VC, '- stopped its stand-in', stand);
+  return true;
+}
+
+function onVcRequest(msg) {
+  var body = {}; try { body = JSON.parse(msg.payload() || '{}'); } catch (e) {}
+  var r = JSON.parse(JSON.stringify((VC_ANSWERS[msg.category()] || {})[msg.method()] || {}));
+  r.returnValue = true; msg.respond(JSON.stringify(r));
+  if (msg.method() === 'setInputEvent') {
+    if (body.event === 'down') pttDown(); else if (body.event === 'up') pttUp();
+  }
+}
+
+function registerVc(attempt) {
+  attempt = attempt || 0;
+  try {
+    var hs = [false, true].map(function (pub) {
+      var h = new palmbus.Handle(VC, pub);
+      Object.keys(VC_ANSWERS).forEach(function (cat) {
+        Object.keys(VC_ANSWERS[cat]).forEach(function (m) { h.registerMethod(cat, m); });
+      });
+      h.addListener('request', onVcRequest);
+      return h;
+    });
+    handles = hs;
+    status.mic = 'ok'; saveStatus();
+    log('registered', VC);
+  } catch (e) {
+    if (attempt === 0) log('luna:', VC, 'is taken (' + e.message + '); retrying');
+    nospyClaim();
+    setTimeout(function () { registerVc(attempt + 1); }, attempt < 10 ? 1000 : 10000);
+  }
+}
+registerVc();
+log('lgtv-assist', VERSION, 'ip', NET.ip, 'mac', MAC);
 
 // ------------------------------------------------------------------ remote mic (LG voiceinput)
 var VI = 'luna://com.webos.service.voiceinput/', VI_PARAMS = { keyType: 'thinQtv', deviceType: 'remote' };
 function viCall(method, cb) {
+  if (!handles) { if (cb) cb('{"returnValue":false}'); return; }
   var c = handles[0].call(VI + method, JSON.stringify(VI_PARAMS));
   c.addListener('response', function (m) { if (cb) cb(m.payload()); });
 }
@@ -104,6 +155,7 @@ function Mic(onData, onOpen, onFail) {
 Mic.prototype.open = function (attempt) {
   var self = this;
   if (this.closed) return;
+  if (!handles) return this.onFail && this.onFail('voiceconductor name not held');
   var c = handles[0].subscribe(VI + 'startStreaming', JSON.stringify({ keyType: 'thinQtv', subscribe: true, deviceType: 'remote' }));
   this.sub = c;
   c.addListener('response', function (m) {
@@ -433,6 +485,7 @@ mdns.start(log);
 
 function shutdown() {
   log('shutting down');
+  try { if (fs.readFileSync(NOSPY_CLAIM, 'utf8').split(' ')[0] === String(process.pid)) fs.unlinkSync(NOSPY_CLAIM); } catch (e) {}
   mdns.stop();
   if (session) abortSession('shutdown');
   stopPlayback(true);
