@@ -1,0 +1,18 @@
+#!/bin/sh
+# webOS Homebrew Channel boot hook: start ha-voice (Home Assistant push-to-talk via the Magic Remote mic).
+# Installed as /var/lib/webosbrew/init.d/60-ha-voice. Source: lgtv_voice/.
+D=/media/developer/ha-voice
+[ -f "$D/config.json" ] || exit 0
+# LG's voiceconductor must not hold the luna name: stub its binary (like nospy does) and stop it.
+if ! grep -q " /usr/sbin/voiceconductor " /proc/mounts; then
+  mount --bind "$D/voiceconductor-stub" /usr/sbin/voiceconductor
+fi
+systemctl stop voiceconductor.service 2>/dev/null
+# voiceinput (LG) stays: it talks to the remote and decodes its audio for us.
+systemctl start voiceinput.service 2>/dev/null
+(
+  while true; do
+    NODE_PATH=/usr/lib/nodejs /usr/bin/node "$D/ha-voice.js" >> /tmp/ha-voice.log 2>&1
+    sleep 3
+  done
+) </dev/null >/dev/null 2>&1 &

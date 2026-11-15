@@ -1,0 +1,6 @@
+{
+ "ha_url": "http://homeassistant.local:8123",
+ "pipeline": "",
+ "device_id": "",
+ "max_seconds": 15
+}
