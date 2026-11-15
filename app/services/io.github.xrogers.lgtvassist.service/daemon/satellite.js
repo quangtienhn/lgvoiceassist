@@ -15,7 +15,7 @@ var net = require('net'), fs = require('fs'), path = require('path'), os = requi
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.2.0';
+var VERSION = '0.2.1';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 var LOG = '/tmp/lgtv-assist.log';
 var STATUS = '/tmp/lgtv-assist.status.json';
@@ -51,6 +51,7 @@ var status = { version: VERSION, started: new Date().toISOString(), ip: NET.ip, 
   ha: null, haSince: null, lastSession: null, lastText: null, lastReply: null, lastError: null };
 function saveStatus() { try { fs.writeFileSync(STATUS, JSON.stringify(status)); } catch (e) {} }
 saveStatus();
+try { fs.writeFileSync('/tmp/lgtv-assist.daemon.pid', String(process.pid)); } catch (e) {}
 
 // ------------------------------------------------------------------ child processes
 // Children must not inherit our luna hub socket (palmbus fds lack CLOEXEC); a child outliving us

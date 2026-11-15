@@ -1,3 +1,4 @@
 # secrets / per-install config
 token
 config.json
+dist/

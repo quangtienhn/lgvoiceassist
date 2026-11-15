@@ -1,0 +1,7 @@
+{
+  "name": "io.github.xrogers.lgtvassist.service",
+  "version": "0.2.1",
+  "description": "LG TV Assist service",
+  "main": "service.js",
+  "license": "MIT"
+}
