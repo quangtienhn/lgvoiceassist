@@ -72,8 +72,8 @@
 
     $('b-elevate').className = 'btn' + (s.root ? ' hidden' : '');
     $('b-toggle').textContent = s.enabled ? 'Wyłącz' : 'Włącz';
-    var toasts = !s.settings || s.settings.toasts !== false;
-    $('b-toasts').textContent = 'Dymki: ' + (toasts ? 'wł.' : 'wył.');
+    var t = s.settings ? s.settings.toasts : true;
+    $('b-toasts').textContent = 'Dymki: ' + (t === false ? 'wył.' : t === 'listen' ? 'tylko nasłuch' : 'wszystkie');
 
     fixFocus();
   }
@@ -109,8 +109,10 @@
       luna(SVC + 'restart', {}, function (r) { msg(r.returnValue ? 'Uruchomiono ponownie.' : 'Błąd: ' + (r.errorText || '')); refresh(); });
     },
     toasts: function () {
-      var cur = !(state.status && state.status.settings && state.status.settings.toasts === false);
-      luna(SVC + 'setSettings', { toasts: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 1500); });
+      // cycle: all -> listening only -> off -> all
+      var cur = state.status && state.status.settings ? state.status.settings.toasts : true;
+      var next = cur === false ? true : cur === 'listen' ? false : 'listen';
+      luna(SVC + 'setSettings', { toasts: next }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 1500); });
     },
     log: function () { openLog(); },
     detail: function () { openDetail(); },

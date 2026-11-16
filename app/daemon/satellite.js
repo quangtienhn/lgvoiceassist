@@ -15,7 +15,7 @@ var net = require('net'), fs = require('fs'), path = require('path'), os = requi
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.5.3';
+var VERSION = '0.5.4';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 var LOG = '/tmp/lgtv-assist.log';
 var STATUS = '/tmp/lgtv-assist.status.json';
@@ -62,8 +62,11 @@ function spawnClean(cmd, args, opts) { return cp.spawn('/bin/sh', ['-c', CLOSE_F
 function lunaSend(uri, params) {
   spawnClean('luna-send', ['-n', '1', '-w', '3000', uri, JSON.stringify(params)], { stdio: 'ignore' }).on('error', function () {});
 }
-function toast(text) {
-  if (!text || !CFG.toasts) return;
+// CFG.toasts: true = all toasts, 'listen' = only the "listening" toast after the wake word, false = none
+function toast(text, kind) {
+  if (!text) return;
+  if (CFG.toasts === false) return;
+  if (CFG.toasts === 'listen' && kind !== 'listen') return;
   lunaSend('luna://com.webos.notification/createToast',
     { message: String(text).slice(0, 180), sourceId: 'com.webos.service.voiceconductor', noaction: true });
 }
@@ -600,7 +603,7 @@ function onVaEvent(client, m) {
       stopPlayback(true);
       duckTv();
       if (CFG.wake_screen !== false && screen.on === false) setScreen(true, 'wake word');
-      toast('🎙️ Słucham…');
+      toast('🎙️ Słucham…', 'listen');
       break;
     case 'STT_VAD_END': if (!s.ptt) finishAudio('vad'); break;
     case 'STT_END':

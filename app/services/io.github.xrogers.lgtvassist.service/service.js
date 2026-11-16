@@ -142,6 +142,7 @@ service.register('setSettings', function (message) {
     if (p[k] !== undefined) s[k] = p[k];
   });
   if (s.name) s.name = String(s.name).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 31);
+  if (s.toasts !== undefined && s.toasts !== true && s.toasts !== false && s.toasts !== 'listen') s.toasts = true;
   try { fs.mkdirSync(DATA); } catch (e) {}
   var prev = readJson(file, {});
   fs.writeFileSync(file, JSON.stringify(s, null, 1));
