@@ -1,6 +1,6 @@
 // LG TV Assist: makes a rooted LG webOS TV an ESPHome voice satellite for Home Assistant.
 //
-//  * Home Assistant connects to us (ESPHome native API, plaintext, port 6053) and finds us via mDNS
+//  * Home Assistant connects to us (ESPHome native API, plaintext or Noise-encrypted, port 6053) and finds us via mDNS
 //    (_esphomelib._tcp). No token or login on the TV.
 //  * Push-to-talk on the Magic Remote mic button: we hold the luna name com.webos.service.voiceconductor
 //    (LG's service is stopped), so keyfilters sends us //setInputEvent down/up.
@@ -12,13 +12,15 @@
 'use strict';
 var palmbus = require('palmbus');
 var net = require('net'), fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process');
-var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
+var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns'), noise = require('./lib/noise');
 var M = msgs.M, E = msgs.E;
 
 var VERSION = '0.5.4';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
-var LOG = '/tmp/lgtv-assist.log';
-var STATUS = '/tmp/lgtv-assist.status.json';
+// LGTV_ASSIST_TMP: prefix of the log/status/pid files (default keeps the paths the TV service reads); for tests
+var TMP = process.env.LGTV_ASSIST_TMP || '/tmp/lgtv-assist';
+var LOG = TMP + '.log';
+var STATUS = TMP + '.status.json';
 
 function readJson(p, dflt) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return dflt; } }
 var CFG = Object.assign({ name: 'lg-tv-assist', friendly_name: 'LG TV', port: 6053, max_seconds: 15,
@@ -51,7 +53,7 @@ var status = { mic: 'starting', usbMic: null, listening: false, version: VERSION
   ha: null, haSince: null, lastSession: null, lastText: null, lastReply: null, lastError: null };
 function saveStatus() { try { fs.writeFileSync(STATUS, JSON.stringify(status)); } catch (e) {} }
 saveStatus();
-try { fs.writeFileSync('/tmp/lgtv-assist.daemon.pid', String(process.pid)); } catch (e) {}
+try { fs.writeFileSync(TMP + '.daemon.pid', String(process.pid)); } catch (e) {}
 
 // ------------------------------------------------------------------ child processes
 // Children must not inherit our luna hub socket (palmbus fds lack CLOEXEC); a child outliving us
@@ -237,36 +239,77 @@ function stopPlayback(silent) {
 function setPlayerState(st) { player.state = st; broadcast('MediaPlayerStateResponse', playerStateMsg()); }
 function playerStateMsg() { return { key: MP_KEY, state: player.state, volume: player.volume, muted: player.muted }; }
 
+// ------------------------------------------------------------------ API encryption (Noise)
+// CFG.encryption === true: only Noise_NNpsk0_25519_ChaChaPoly_SHA256 connections are accepted, with the
+// pre-shared key CFG.api_key (base64 of 32 bytes, as ESPHome's `api: encryption: key:`). With encryption on
+// and no usable key we make a new one and store it in settings.json: never fall back to plaintext.
+var ENCRYPTED = CFG.encryption === true;
+var API_KEY = null;
+if (ENCRYPTED) {
+  API_KEY = noise.parseKey(CFG.api_key);
+  if (!API_KEY) {
+    var newKey = noise.generateKey();
+    log('api: encryption is on but api_key is ' + (CFG.api_key ? 'invalid' : 'missing') + '; generated a new key');
+    try {
+      var sf = path.join(DATA_DIR, 'settings.json'), cur = readJson(sf, {}), tmpf = sf + '.tmp';
+      cur.api_key = newKey;
+      fs.writeFileSync(tmpf, JSON.stringify(cur, null, 2) + '\n', { mode: 0o600 });
+      fs.renameSync(tmpf, sf);
+      log('api: new api_key saved to settings.json');
+    } catch (e) {
+      log('api: could not save the new api_key (' + e.message + '); it is only valid until the daemon restarts');
+      status.lastError = 'api_key not saved: ' + e.message;
+    }
+    CFG.api_key = newKey;
+    API_KEY = noise.parseKey(newKey);
+  }
+}
+status.encryption = ENCRYPTED; saveStatus();
+var HELLO_TIMEOUT_MS = 20000;   // an encrypted client must finish the handshake within this time
+
 // ------------------------------------------------------------------ ESPHome API server
 var clients = [];          // connected API clients
 var va = null;             // client subscribed to voice assistant
 
 function Client(sock) {
   this.sock = sock; this.buf = Buffer.alloc(0); this.name = '?'; this.subscribedStates = false;
+  this.noise = null;      // Noise transport (encryption on); null = plaintext framing
   clients.push(this);
 }
 Client.prototype.send = function (type, obj) {
   if (this.sock.destroyed) return;
   var def = M[type], body = pb.encode(def[1], obj || {}), hdr = [0];
+  if (this.noise) { this.noise.send(def[0], body); return; }
   pb.writeVarint(hdr, body.length); pb.writeVarint(hdr, def[0]);
   this.sock.write(Buffer.concat([Buffer.from(hdr), body]));
 };
 Client.prototype.onData = function (d) {
+  if (this.noise) return this.noise.receive(d);
+  if (this.rejected) return;
   this.buf = Buffer.concat([this.buf, d]);
   while (this.buf.length >= 3) {
-    if (this.buf[0] !== 0) { log('api: bad preamble (encrypted client?)'); this.sock.destroy(); return; }
+    if (this.buf[0] !== 0) {
+      // like a plaintext ESPHome device: "\0Bad indicator byte" tells a Noise client that we speak plaintext
+      log('api: encrypted client but encryption is off; told it we use plaintext');
+      this.rejected = true; this.sock.end(noise.PLAIN_BAD_INDICATOR);
+      var s = this.sock; setTimeout(function () { s.destroy(); }, 2000);
+      return;
+    }
     var r1, r2;
     try { r1 = pb.readVarint(this.buf, 1); r2 = pb.readVarint(this.buf, r1[1]); } catch (e) { return; }
     var len = r1[0], type = r2[0], start = r2[1];
     if (this.buf.length < start + len) return;
     var payload = this.buf.slice(start, start + len);
     this.buf = this.buf.slice(start + len);
-    var name = msgs.byId[type];
-    if (!name) continue;
-    var msg = {};
-    try { msg = pb.decode(M[name][1], payload); } catch (e) { log('api: decode', name, e.message); continue; }
-    try { this.handle(name, msg); } catch (e) { log('api: handler', name, e.stack); }
+    this.dispatch(type, payload);
   }
+};
+Client.prototype.dispatch = function (type, payload) {
+  var name = msgs.byId[type];
+  if (!name) return;
+  var msg = {};
+  try { msg = pb.decode(M[name][1], payload); } catch (e) { log('api: decode', name, e.message); return; }
+  try { this.handle(name, msg); } catch (e) { log('api: handler', name, e.stack); }
 };
 Client.prototype.handle = function (name, m) {
   var self = this;
@@ -281,7 +324,7 @@ Client.prototype.handle = function (name, m) {
       return this.send('DeviceInfoResponse', {
         name: CFG.name, friendly_name: CFG.friendly_name, mac_address: MAC, esphome_version: '2025.9.0',
         model: 'LG webOS TV (Magic Remote mic)', manufacturer: 'LG Electronics', project_name: 'lgtv-assist.LG TV Assist',
-        project_version: VERSION, suggested_area: CFG.suggested_area,
+        project_version: VERSION, suggested_area: CFG.suggested_area, api_encryption_supported: ENCRYPTED,
         voice_assistant_feature_flags: E.VA_FEATURE.VOICE_ASSISTANT | E.VA_FEATURE.API_AUDIO | E.VA_FEATURE.ANNOUNCE |
           E.VA_FEATURE.START_CONVERSATION | E.VA_FEATURE.TIMERS });
     case 'ListEntitiesRequest':
@@ -339,12 +382,26 @@ function setHa(c) {
 function broadcast(type, obj) { clients.forEach(function (c) { if (c.subscribedStates) c.send(type, obj); }); }
 
 var server = net.createServer(function (sock) {
-  var c = new Client(sock);
+  var c = new Client(sock), hsTimer = null;
   sock.setNoDelay(true);
   log('api: connection from', sock.remoteAddress);
-  sock.on('data', function (d) { c.onData(d); });
+  if (ENCRYPTED) {
+    c.noise = new noise.Transport({ psk: API_KEY, name: CFG.name, mac: MAC.replace(/:/g, '').toLowerCase(),
+      write: function (b) { if (!sock.destroyed) sock.write(b); },
+      onPacket: function (type, data) { c.dispatch(type, data); },
+      onReady: function () { clearTimeout(hsTimer); },
+      onClose: function (why) {
+        clearTimeout(hsTimer);
+        log('api: closing', sock.remoteAddress + ':', why);
+        sock.end(); setTimeout(function () { sock.destroy(); }, 2000);
+      } });
+    hsTimer = setTimeout(function () { if (!c.noise.isReady()) c.noise.close('handshake timeout'); }, HELLO_TIMEOUT_MS);
+  }
+  sock.on('data', function (d) {
+    try { c.onData(d); } catch (e) { log('api: error from', sock.remoteAddress + ':', e.stack || e); sock.destroy(); }
+  });
   sock.on('error', function () {});
-  sock.on('close', function () { log('api: closed', sock.remoteAddress); c.closed(); });
+  sock.on('close', function () { clearTimeout(hsTimer); log('api: closed', sock.remoteAddress); c.closed(); });
 });
 server.on('error', function (e) { log('api server error', e.message); process.exit(1); });
 server.listen(CFG.port, '0.0.0.0', function () { log('api: listening on', CFG.port); });
@@ -701,6 +758,7 @@ var mdns = new Mdns({ instance: CFG.name, host: CFG.name, ip: NET.ip, port: CFG.
   txt: { friendly_name: CFG.friendly_name, version: '2025.9.0', mac: MAC.replace(/:/g, '').toLowerCase(),
     platform: 'HOST', board: 'lg-webos', network: NET.ifname.indexOf('wlan') === 0 ? 'wifi' : 'ethernet',
     project_name: 'lgtv-assist.LG TV Assist', project_version: VERSION } });
+if (ENCRYPTED) mdns.o.txt.api_encryption = noise.NOISE_NAME;
 mdns.start(log);
 
 function shutdown() {
