@@ -15,14 +15,14 @@ var net = require('net'), fs = require('fs'), path = require('path'), os = requi
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.3.0';
+var VERSION = '0.4.0';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 var LOG = '/tmp/lgtv-assist.log';
 var STATUS = '/tmp/lgtv-assist.status.json';
 
 function readJson(p, dflt) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return dflt; } }
 var CFG = Object.assign({ name: 'lg-tv-assist', friendly_name: 'LG TV', port: 6053, max_seconds: 15,
-  toasts: true, suggested_area: '' }, readJson(path.join(DATA_DIR, 'settings.json'), {}));
+  toasts: true, suggested_area: '', hands_free: true, mic_gain: 85, duck: true, duck_volume: 5 }, readJson(path.join(DATA_DIR, 'settings.json'), {}));
 
 function log() {
   var s = new Date().toISOString().slice(11, 23) + ' ' + Array.prototype.join.call(arguments, ' ');
@@ -47,7 +47,7 @@ var NET = netInfo();
 var MAC = NET.mac.toUpperCase();
 
 // ------------------------------------------------------------------ status (for the app UI)
-var status = { mic: 'starting', version: VERSION, started: new Date().toISOString(), ip: NET.ip, port: CFG.port, name: CFG.name,
+var status = { mic: 'starting', usbMic: null, listening: false, version: VERSION, started: new Date().toISOString(), ip: NET.ip, port: CFG.port, name: CFG.name,
   ha: null, haSince: null, lastSession: null, lastText: null, lastReply: null, lastError: null };
 function saveStatus() { try { fs.writeFileSync(STATUS, JSON.stringify(status)); } catch (e) {} }
 saveStatus();
@@ -197,6 +197,7 @@ var player = { proc: null, queue: [], state: E.MP_STATE.IDLE, volume: 1.0, muted
 
 function playUrls(urls, announcement, done) {
   stopPlayback(true);
+  if (session && session.type === 'wake' && !session.woke) abortSession('playback');
   player.queue = urls.filter(Boolean);
   player.announcing = !!announcement;
   player.done = done || null;
@@ -209,7 +210,7 @@ function playNext() {
     player.proc = null;
     setPlayerState(E.MP_STATE.IDLE);
     var cb = player.done; player.done = null;
-    if (cb) cb(true);
+    if (cb) cb(true); else scheduleListening(300);
     return;
   }
   var scale = player.muted ? 0 : Math.round(32768 * player.volume);
@@ -302,7 +303,7 @@ Client.prototype.handle = function (name, m) {
       }
       return;
     case 'SubscribeVoiceAssistantRequest':
-      if (m.subscribe) { va = this; log('api: voice assistant subscribed by', this.name, '(flags ' + (m.flags || 0) + ')'); setHa(this); }
+      if (m.subscribe) { va = this; log('api: voice assistant subscribed by', this.name, '(flags ' + (m.flags || 0) + ')'); setHa(this); scheduleListening(1000); }
       else if (va === this) { va = null; setHa(null); }
       return;
     case 'VoiceAssistantConfigurationRequest':
@@ -338,30 +339,116 @@ var server = net.createServer(function (sock) {
 server.on('error', function (e) { log('api server error', e.message); process.exit(1); });
 server.listen(CFG.port, '0.0.0.0', function () { log('api: listening on', CFG.port); });
 
+// ------------------------------------------------------------------ USB microphone (hands-free)
+// A USB microphone shows up in LG's PulseAudio as alsa_input.usb-*. We read it with parec (16 kHz mono)
+// and let Home Assistant detect the wake word (pipeline wake word stage, e.g. openWakeWord).
+var usb = { source: null, configured: null, checking: false };
+var PA = ['-s', 'unix:/var/run/pulse/native'];
+
+function checkUsbMic() {
+  if (usb.checking) return;
+  usb.checking = true;
+  var out = '', p = spawnClean('pactl', PA.concat(['list', 'sources', 'short']));
+  p.stdout.on('data', function (d) { out += d; });
+  p.on('error', function () { usb.checking = false; });
+  p.on('close', function () {
+    usb.checking = false;
+    var src = null;
+    out.split('\n').forEach(function (l) {
+      var name = l.split('\t')[1];
+      if (name && /^alsa_input\.usb-/.test(name) && !/\.monitor$/.test(name) && !src) src = name;
+    });
+    if (src !== usb.source) {
+      log('usb mic:', src || 'none');
+      usb.source = src;
+      status.usbMic = src; saveStatus();
+      if (src) configureUsbMic(src);
+      else if (session && session.type === 'wake') abortSession('usb mic removed');
+    }
+    ensureListening();
+  });
+}
+
+function configureUsbMic(src) {
+  // software volume 100 %, hardware capture gain on every USB card (default ~19 dB is too quiet for a room)
+  spawnClean('pactl', PA.concat(['set-source-volume', src, '100%']), { stdio: 'ignore' }).on('error', function () {});
+  try {
+    fs.readFileSync('/proc/asound/cards', 'utf8').split('\n').forEach(function (l) {
+      var m = /^\s*(\d+)\s+\[.*\]:\s*USB-Audio/.exec(l);
+      if (m) spawnClean('amixer', ['-q', '-c', m[1], 'sset', 'Mic', 'capture', (CFG.mic_gain || 85) + '%', 'cap'], { stdio: 'ignore' }).on('error', function () {});
+    });
+  } catch (e) {}
+  usb.configured = src;
+}
+
+function UsbMic(src, onData) {
+  this.closed = false;
+  var p = this.proc = spawnClean('parec', PA.concat(['-d', src, '--rate=16000', '--channels=1', '--format=s16le', '--latency-msec=40']));
+  var self = this;
+  p.stdout.on('data', function (pcm) { if (!self.closed) onData(pcm); });
+  p.on('error', function () {});
+  p.on('exit', function () { if (!self.closed) { log('usb mic: parec exited'); usb.source = null; } });
+}
+UsbMic.prototype.close = function () { this.closed = true; try { this.proc.kill(); } catch (e) {} };
+
+// ------------------------------------------------------------------ TV volume ducking
+var duck = { saved: null };
+function getTvVolume(cb) {
+  if (!handles) return cb(null);
+  var c = handles[0].call('luna://com.webos.service.audio/master/getVolume', '{}');
+  c.addListener('response', function (m) {
+    var r = {}; try { r = JSON.parse(m.payload()); } catch (e) {}
+    cb(r.volumeStatus && typeof r.volumeStatus.volume === 'number' ? r.volumeStatus.volume : (typeof r.volume === 'number' ? r.volume : null));
+  });
+}
+function duckTv() {
+  if (CFG.duck === false || duck.saved !== null) return;
+  getTvVolume(function (v) {
+    var target = CFG.duck_volume === undefined ? 5 : CFG.duck_volume;
+    if (v === null || v <= target) return;
+    duck.saved = v;
+    lunaSend('luna://com.webos.service.audio/master/setVolume', { volume: target });
+  });
+}
+function restoreTv() {
+  if (duck.saved === null) return;
+  lunaSend('luna://com.webos.service.audio/master/setVolume', { volume: duck.saved });
+  duck.saved = null;
+}
+
 // ------------------------------------------------------------------ voice session
-var session = null;
+// types: 'ptt'  - Magic Remote mic while the button is held (end = button release)
+//        'vad'  - follow-up without a button (continue_conversation / start_conversation); HA's VAD ends it
+//        'wake' - hands-free: USB mic streamed continuously, HA detects the wake word, then STT with VAD
+var session = null, listenTimer = null, listenBackoff = 0;
 
 function startSession(opts) {
-  // opts: { ptt: bool, conversation_id }
   if (session) return;
-  if (!va) { toast('Home Assistant nie jest połączony z telewizorem'); return; }
-  var s = session = { ptt: !!opts.ptt, started: false, ended: false, audioEnded: false, buf: [], bytes: 0, t0: Date.now(),
-    client: va, ttsUrl: null, text: null, reply: null };
-  status.lastSession = new Date().toISOString(); saveStatus();
-  stopPlayback(true);
-  s.maxTimer = setTimeout(function () { finishAudio('max length'); }, CFG.max_seconds * 1000);
-  va.send('VoiceAssistantRequest', { start: true, flags: s.ptt ? 0 : E.VA_REQUEST_FLAG.USE_VAD,
-    conversation_id: opts.conversation_id || '', wake_word_phrase: '' });
-  s.mic = new Mic(function (pcm) { onMicData(s, pcm); }, null, function (why) {
-    toast(s.ptt ? 'Mikrofon pilota niedostępny' : 'Naciśnij mikrofon na pilocie, aby odpowiedzieć');
-    abortSession('mic: ' + why);
-  });
+  if (!va) { if (opts.type !== 'wake') toast('Home Assistant nie jest połączony z telewizorem'); return; }
+  var type = opts.type || 'ptt';
+  var s = session = { type: type, ptt: type === 'ptt', started: false, audioEnded: false, buf: [], bytes: 0, t0: Date.now(),
+    client: va, woke: false };
+  if (type !== 'wake') { status.lastSession = new Date().toISOString(); saveStatus(); stopPlayback(true); }
+  if (type !== 'wake') s.maxTimer = setTimeout(function () { finishAudio('max length'); }, CFG.max_seconds * 1000);
+  var flags = type === 'ptt' ? 0 : type === 'wake' ? (E.VA_REQUEST_FLAG.USE_WAKE_WORD | E.VA_REQUEST_FLAG.USE_VAD) : E.VA_REQUEST_FLAG.USE_VAD;
+  va.send('VoiceAssistantRequest', { start: true, flags: flags, conversation_id: opts.conversation_id || '', wake_word_phrase: '' });
+  var onData = function (pcm) { onMicData(s, pcm); };
+  if (type === 'ptt' || !usb.source) {
+    s.mic = new Mic(onData, null, function (why) {
+      if (type === 'ptt') toast('Mikrofon pilota niedostępny');
+      else if (type === 'vad') toast('Naciśnij mikrofon na pilocie, aby odpowiedzieć');
+      abortSession('mic: ' + why);
+    });
+  } else {
+    s.mic = new UsbMic(usb.source, onData);
+  }
+  status.listening = type === 'wake'; saveStatus();
 }
 
 function onMicData(s, pcm) {
   if (s.audioEnded) return;
   s.bytes += pcm.length;
-  if (!s.started) { s.buf.push(pcm); return; }
+  if (!s.started) { if (s.type !== 'wake' || s.buf.length < 50) s.buf.push(pcm); return; }
   sendAudio(s, pcm);
 }
 function sendAudio(s, pcm) {
@@ -371,7 +458,12 @@ function sendAudio(s, pcm) {
 function onVaResponse(client, m) {
   var s = session;
   if (!s || client !== s.client) return;
-  if (m.error) { log('va: HA could not start the pipeline'); toast('Asystent HA niedostępny'); return abortSession('ha error'); }
+  if (m.error) {
+    log('va: HA could not start the pipeline');
+    if (s.type !== 'wake') toast('Asystent HA niedostępny');
+    listenBackoff = Date.now() + 30000;
+    return abortSession('ha error');
+  }
   s.started = true;   // port 0 = audio over the API connection
   while (s.buf.length) sendAudio(s, s.buf.shift());
   if (s.audioEnded) s.client.send('VoiceAssistantAudio', { end: true });
@@ -401,26 +493,51 @@ function abortSession(why) {
   endSession(why);
 }
 
-function endSession(why, quiet) {
+function endSession(why) {
   var s = session;
   if (!s) return;
   clearTimeout(s.maxTimer);
   if (!s.audioEnded) { s.audioEnded = true; s.mic.close(); }
   session = null;
-  log('va: session end:', why);
+  status.listening = false; saveStatus();
+  if (s.type !== 'wake' || s.woke || why !== 'run end') log('va: session end:', why);
+  if (!player.proc) restoreTv();
+  scheduleListening(why === 'run end' ? 300 : 1500);
+}
+
+// (Re)start the hands-free wake word session whenever nothing else is going on.
+function ensureListening() {
+  if (CFG.hands_free === false || !usb.source || !va || session || player.proc || !handles) return;
+  if (Date.now() < listenBackoff) return scheduleListening(listenBackoff - Date.now());
+  restoreTv();
+  startSession({ type: 'wake' });
+}
+function scheduleListening(ms) {
+  clearTimeout(listenTimer);
+  listenTimer = setTimeout(ensureListening, ms || 300);
 }
 
 function evData(m) { var d = {}; (m.data || []).forEach(function (x) { d[x.name] = x.value; }); return d; }
 
 function onVaEvent(client, m) {
   var type = E.VA_EVENT[m.event_type], d = evData(m), s = session;
-  if (type !== 'INTENT_PROGRESS') log('va event', type, JSON.stringify(d).slice(0, 200));
+  var quiet = s && s.type === 'wake' && !s.woke && /^(RUN_START|WAKE_WORD_START)$/.test(type);
+  if (type !== 'INTENT_PROGRESS' && !quiet) log('va event', type, JSON.stringify(d).slice(0, 200));
   if (!s || client !== s.client) return;
   switch (type) {
+    case 'WAKE_WORD_END':
+      s.woke = true;
+      s.bytes = 0;
+      status.lastSession = new Date().toISOString(); saveStatus();
+      s.maxTimer = setTimeout(function () { finishAudio('max length'); }, CFG.max_seconds * 1000);
+      stopPlayback(true);
+      duckTv();
+      toast('🎙️ Słucham…');
+      break;
     case 'STT_VAD_END': if (!s.ptt) finishAudio('vad'); break;
     case 'STT_END':
       if (!s.audioEnded) finishAudio('stt end');
-      s.text = d.text; status.lastText = d.text; saveStatus();
+      status.lastText = d.text; saveStatus();
       if (d.text) toast('🎤 ' + d.text);
       break;
     case 'INTENT_END':
@@ -428,19 +545,28 @@ function onVaEvent(client, m) {
       s.conversationId = d.conversation_id || s.conversationId;
       break;
     case 'TTS_START':
-      s.reply = d.text; status.lastReply = d.text; saveStatus();
+      // LLM/conversation agent errors come back as English error dumps: show a short note, don't speak them
+      if (d.text && /problem getting a response|RESOURCE_EXHAUSTED|Unable to get response/.test(d.text)) {
+        s.muteTts = true;
+        d.text = 'Asystent AI chwilowo niedostępny — działają komendy lokalne';
+      }
+      status.lastReply = d.text; saveStatus();
       if (d.text) toast(d.text);
       break;
     case 'TTS_END':
+      if (d.url && s.muteTts) { scheduleListening(300); break; }
       if (d.url) {
         var cont = s.continueConversation, conv = s.conversationId;
+        restoreTv();
         playUrls([d.url], true, function (ok) {
-          if (ok && cont) startSession({ ptt: false, conversation_id: conv });
+          if (ok && cont) startSession({ type: 'vad', conversation_id: conv });
+          else scheduleListening(300);
         });
       }
       break;
     case 'ERROR':
       status.lastError = (d.code || '') + ' ' + (d.message || ''); saveStatus();
+      if (s.type === 'wake' && !s.woke) { log('va: wake word stage error', d.code); listenBackoff = Date.now() + 10000; break; }
       toast(d.code === 'stt-no-text-recognized' ? 'Nie usłyszałem polecenia' : 'Asystent: ' + (d.message || d.code));
       break;
     case 'RUN_END':
@@ -452,9 +578,11 @@ function onVaEvent(client, m) {
 function onAnnounce(client, m) {
   log('announce:', m.text || '', m.media_id);
   if (m.text) toast('📢 ' + m.text);
+  if (session && session.type === 'wake' && !session.woke) abortSession('announcement');
   playUrls([m.preannounce_media_id, m.media_id], true, function (ok) {
     client.send('VoiceAssistantAnnounceFinished', { success: ok });
-    if (ok && m.start_conversation) startSession({ ptt: false });
+    if (ok && m.start_conversation) startSession({ type: 'vad' });
+    else scheduleListening(300);
   });
 }
 
@@ -468,13 +596,20 @@ function onTimer(m) {
 // ------------------------------------------------------------------ push-to-talk
 function pttDown() {
   log('key: mic down');
+  if (session && session.type === 'wake' && !session.woke) {
+    abortSession('ptt');               // the remote wins over hands-free listening
+    clearTimeout(listenTimer);
+  }
   if (session) return;
-  startSession({ ptt: true });
+  startSession({ type: 'ptt' });
 }
 function pttUp() {
   log('key: mic up');
   if (session && session.ptt) finishAudio('key up');
 }
+
+checkUsbMic();
+setInterval(checkUsbMic, 15000);
 
 // ------------------------------------------------------------------ mDNS
 var mdns = new Mdns({ instance: CFG.name, host: CFG.name, ip: NET.ip, port: CFG.port,

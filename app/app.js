@@ -34,6 +34,12 @@
     $('ha').textContent = connected ? 'połączony — ' + d.ha : 'czeka na połączenie';
     setCard('c-ha', connected ? 'ok' : 'warn');
     $('addr').textContent = (d.ip || '?') + ':' + (d.port || 6053) + '  (' + (d.name || 'lg-tv-assist') + ')';
+    var handsOn = !s.settings || s.settings.hands_free !== false;
+    var micName = d.usbMic ? d.usbMic.replace(/^alsa_input\.usb-/, '').replace(/\.analog-.*$/, '').replace(/-\d+$/, '').replace(/_/g, ' ') : null;
+    $('usb').textContent = !micName ? 'brak — podłącz mikrofon USB do telewizora'
+      : !handsOn ? micName + ' — tryb wyłączony'
+      : (d.listening ? '● nasłuchuje „Okay Nabu” — ' : '') + micName;
+    $('b-hands').textContent = 'Bez pilota: ' + (handsOn ? 'wł.' : 'wył.');
     $('lastText').textContent = d.lastText || '—';
     $('lastReply').textContent = d.lastReply || (d.lastError ? '⚠ ' + d.lastError : '—');
 
@@ -41,6 +47,7 @@
     if (!s.root) hint = 'Usługa potrzebuje uprawnień roota, żeby przejąć przycisk mikrofonu pilota. Wybierz <b>Nadaj uprawnienia</b>, a potem uruchom aplikację ponownie.';
     else if (!connected) hint = 'W Home Assistant otwórz <b>Ustawienia → Urządzenia i usługi</b>. Telewizor pojawi się jako wykryte urządzenie ESPHome <b>„' +
       ((s.settings && s.settings.friendly_name) || 'LG TV') + '”</b> — kliknij <b>Dodaj</b>. Ręcznie: integracja ESPHome, host <b>' + (d.ip || '?') + '</b>, port <b>' + (d.port || 6053) + '</b>, bez klucza.';
+    else if (d.usbMic && (!s.settings || s.settings.hands_free !== false)) hint = 'Powiedz <b>„Okay Nabu”</b> i polecenie (mikrofon USB, słowo wykrywa Home Assistant) albo przytrzymaj <b>przycisk mikrofonu</b> na pilocie. Po usłyszeniu słowa telewizor się przycisza. Słowo aktywujące zmienisz w Home Assistant, w ustawieniach asystenta.';
     else hint = 'Przytrzymaj <b>przycisk mikrofonu</b> na pilocie, powiedz polecenie i puść. Odpowiedź pojawi się w dymku i zostanie odczytana. Komunikaty z Home Assistant (assist_satellite.announce) też są odtwarzane na telewizorze.';
     $('hint').innerHTML = hint;
 
@@ -103,6 +110,11 @@
       luna(SVC + 'setSettings', { toasts: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 3500); });
     },
     log: function () { state.showLog = !state.showLog; refresh(); },
+    hands: function () {
+      var cur = !(state.status && state.status.settings && state.status.settings.hands_free === false);
+      msg(cur ? 'Wyłączam tryb bez pilota…' : 'Włączam tryb bez pilota…');
+      luna(SVC + 'setSettings', { hands_free: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 4000); });
+    },
     nospy: function () {
       luna('luna://com.webos.applicationManager/launch', { id: 'ooo.lew.lifesgoodwithoutspying' }, function (r) {
         if (!r.returnValue) msg('Nie udało się otworzyć: ' + (r.errorText || ''));
