@@ -112,7 +112,7 @@
     },
     toasts: function () {
       var cur = !(state.status && state.status.settings && state.status.settings.toasts === false);
-      luna(SVC + 'setSettings', { toasts: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 3500); });
+      luna(SVC + 'setSettings', { toasts: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 1500); });
     },
     log: function () { state.showLog = !state.showLog; refresh(); },
     detail: function () { openDetail(); },

@@ -143,10 +143,13 @@ service.register('setSettings', function (message) {
   });
   if (s.name) s.name = String(s.name).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 31);
   try { fs.mkdirSync(DATA); } catch (e) {}
+  var prev = readJson(file, {});
   fs.writeFileSync(file, JSON.stringify(s, null, 1));
-  var pid = alive('/tmp/lgtv-assist.daemon.pid');
+  // the daemon picks up most settings live; identity changes (name/port) need a restart
+  var restart = prev.name !== s.name || prev.friendly_name !== s.friendly_name || prev.port !== s.port;
+  var pid = restart && alive('/tmp/lgtv-assist.daemon.pid');
   if (pid) { try { process.kill(pid, 'SIGTERM'); } catch (e) {} }
-  message.respond({ returnValue: true, settings: s });
+  message.respond({ returnValue: true, settings: s, restarted: !!pid });
 });
 
 service.register('nospyRegister', function (message) {

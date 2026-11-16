@@ -15,7 +15,7 @@ var net = require('net'), fs = require('fs'), path = require('path'), os = requi
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.5.1';
+var VERSION = '0.5.2';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 var LOG = '/tmp/lgtv-assist.log';
 var STATUS = '/tmp/lgtv-assist.status.json';
@@ -675,6 +675,19 @@ function pttUp() {
   log('key: mic up');
   if (session && session.ptt) finishAudio('key up');
 }
+
+// Live settings: toasts / hands_free / wake_screen / duck / mic_gain apply without a restart
+// (the service restarts the daemon only when the name or port changes).
+var SETTINGS = path.join(DATA_DIR, 'settings.json');
+fs.watchFile(SETTINGS, { interval: 1000 }, function () {
+  var next = readJson(SETTINGS, {});
+  ['toasts', 'hands_free', 'wake_screen', 'duck', 'duck_volume', 'mic_gain', 'max_seconds'].forEach(function (k) {
+    if (next[k] !== undefined && next[k] !== CFG[k]) { log('settings:', k, '=', JSON.stringify(next[k])); CFG[k] = next[k]; }
+  });
+  if (usb.source && next.mic_gain !== undefined) configureUsbMic(usb.source);
+  if (CFG.hands_free === false && session && session.type === 'wake' && !session.woke) abortSession('hands-free off');
+  else scheduleListening(300);
+});
 
 checkUsbMic();
 setInterval(checkUsbMic, 15000);
