@@ -31,6 +31,10 @@ var M = {
   GetTimeRequest: [36, {}],
   GetTimeResponse: [37, { epoch_seconds: [1, 'fixed32'], timezone: [2, 'string'] }],
   SubscribeHomeAssistantStatesRequest: [38, {}],
+  ListEntitiesSwitchResponse: [17, { object_id: [1, 'string'], key: [2, 'fixed32'], name: [3, 'string'], icon: [5, 'string'],
+    assumed_state: [6, 'bool'], disabled_by_default: [7, 'bool'], entity_category: [8, 'enum'], device_class: [9, 'string'] }],
+  SwitchStateResponse: [26, { key: [1, 'fixed32'], state: [2, 'bool'], missing_state: [4, 'bool'] }],
+  SwitchCommandRequest: [33, { key: [1, 'fixed32'], state: [2, 'bool'] }],
   ListEntitiesMediaPlayerResponse: [63, {
     object_id: [1, 'string'], key: [2, 'fixed32'], name: [3, 'string'], icon: [5, 'string'],
     supports_pause: [8, 'bool'], supported_formats: [9, 'message', S.MediaPlayerSupportedFormat, true],

@@ -15,14 +15,14 @@ var net = require('net'), fs = require('fs'), path = require('path'), os = requi
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.4.1';
+var VERSION = '0.5.1';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 var LOG = '/tmp/lgtv-assist.log';
 var STATUS = '/tmp/lgtv-assist.status.json';
 
 function readJson(p, dflt) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return dflt; } }
 var CFG = Object.assign({ name: 'lg-tv-assist', friendly_name: 'LG TV', port: 6053, max_seconds: 15,
-  toasts: true, suggested_area: '', hands_free: true, mic_gain: 85, duck: true, duck_volume: 5 }, readJson(path.join(DATA_DIR, 'settings.json'), {}));
+  toasts: true, suggested_area: '', hands_free: true, mic_gain: 85, duck: true, duck_volume: 5, wake_screen: true }, readJson(path.join(DATA_DIR, 'settings.json'), {}));
 
 function log() {
   var s = new Date().toISOString().slice(11, 23) + ' ' + Array.prototype.join.call(arguments, ' ');
@@ -184,11 +184,12 @@ Mic.prototype.close = function () {
   clearInterval(this.keep);
   if (this.sock) { try { this.sock.destroy(); } catch (e) {} }
   var sub = this.sub, opened = !!this.sock;
-  // stop as the same client that started, then drop the subscription
-  if (opened) viCall('stopStreaming', function (out) {
-    if (!/"returnValue"\s*:\s*true/.test(out)) log('mic: stopStreaming', out);
-    try { sub.cancel(); } catch (e) {}
-  }); else { try { sub.cancel(); } catch (e) {} }
+  // Stop as the same client that started, then drop the subscription. Also when the socket isn't
+  // open yet: voiceinput may already be capturing, and would refuse the next start for seconds.
+  viCall('stopStreaming', function (out) {
+    if (opened && !/"returnValue"\s*:\s*true/.test(out)) log('mic: stopStreaming', out);
+    try { if (sub) sub.cancel(); } catch (e) {}
+  });
 };
 
 // ------------------------------------------------------------------ player
@@ -287,11 +288,16 @@ Client.prototype.handle = function (name, m) {
         supported_formats: [{ format: 'mp3', purpose: 0 }, { format: 'mp3', purpose: 1 }],
         feature_flags: E.MP_FEATURE.PLAY | E.MP_FEATURE.STOP | E.MP_FEATURE.PLAY_MEDIA | E.MP_FEATURE.VOLUME_SET |
           E.MP_FEATURE.VOLUME_MUTE | E.MP_FEATURE.MEDIA_ANNOUNCE });
+      this.send('ListEntitiesSwitchResponse', { object_id: 'lg_tv_screen', key: SCREEN_KEY, name: 'Ekran', icon: 'mdi:television' });
       return this.send('ListEntitiesDoneResponse', {});
     case 'SubscribeStatesRequest':
     case 'SubscribeHomeAssistantStatesRequest':
       this.subscribedStates = true;
+      this.send('SwitchStateResponse', screenStateMsg());
       return this.send('MediaPlayerStateResponse', playerStateMsg());
+    case 'SwitchCommandRequest':
+      if (m.key === SCREEN_KEY) setScreen(!!m.state, 'home assistant');
+      return;
     case 'MediaPlayerCommandRequest':
       if (m.has_media_url && m.media_url) { log('media: play', m.media_url); playUrls([m.media_url], m.announcement); }
       if (m.has_volume) { player.volume = Math.max(0, Math.min(1, m.volume || 0)); setPlayerState(player.state); }
@@ -417,6 +423,40 @@ function restoreTv() {
   duck.saved = null;
 }
 
+// ------------------------------------------------------------------ screen (switch entity "Ekran")
+// "Screen off" keeps the TV running (mic, hands-free listening, audio replies) with the panel dark.
+// Real standby (power button, Quick Start+) suspends the whole system, so nothing can listen then.
+var SCREEN_KEY = 0x5343524e;   // 'SCRN'
+var screen = { state: null, on: null, sub: null };
+function screenIsOn(st) { return !!st && !/screen off|standby|suspend|power off/i.test(st); }
+// tvpower only answers luna-send (our palmbus handles get "Not permitted"): keep a luna-send -i subscription
+function watchScreen() {
+  if (screen.sub) return;
+  var p = screen.sub = spawnClean('luna-send', ['-i', 'luna://com.webos.service.tvpower/power/getPowerState', '{"subscribe":true}']);
+  var buf = '';
+  p.stdout.on('data', function (d) {
+    buf += d;
+    var i;
+    while ((i = buf.indexOf('}')) >= 0) {           // one flat JSON object per response
+      var chunk = buf.slice(0, i + 1); buf = buf.slice(i + 1);
+      var j = chunk.lastIndexOf('{'); if (j < 0) continue;
+      var r = {}; try { r = JSON.parse(chunk.slice(j)); } catch (e) { continue; }
+      if (!r.state) continue;
+      var on = screenIsOn(r.state);
+      if (r.state !== screen.state) log('screen:', r.state + (r.processing ? ' (' + r.processing + ')' : ''));
+      screen.state = r.state;
+      if (on !== screen.on) { screen.on = on; status.screen = r.state; saveStatus(); broadcast('SwitchStateResponse', screenStateMsg()); }
+    }
+  });
+  p.on('error', function () {});
+  p.on('exit', function () { screen.sub = null; setTimeout(watchScreen, 5000); });
+}
+function screenStateMsg() { return { key: SCREEN_KEY, state: !!screen.on, missing_state: screen.on === null }; }
+function setScreen(on, why) {
+  log('screen:', on ? 'turn on' : 'turn off', '(' + why + ')');
+  lunaSend('luna://com.webos.service.tvpower/power/' + (on ? 'turnOnScreen' : 'turnOffScreen'), {});
+}
+
 // ------------------------------------------------------------------ voice session
 // types: 'ptt'  - Magic Remote mic while the button is held (end = button release)
 //        'vad'  - follow-up without a button (continue_conversation / start_conversation); HA's VAD ends it
@@ -431,8 +471,11 @@ function startSession(opts) {
     client: va, woke: false };
   if (type !== 'wake') { status.lastSession = new Date().toISOString(); saveStatus(); stopPlayback(true); }
   if (type !== 'wake') s.maxTimer = setTimeout(function () { finishAudio('max length'); }, CFG.max_seconds * 1000);
-  var flags = type === 'ptt' ? 0 : type === 'wake' ? (E.VA_REQUEST_FLAG.USE_WAKE_WORD | E.VA_REQUEST_FLAG.USE_VAD) : E.VA_REQUEST_FLAG.USE_VAD;
-  va.send('VoiceAssistantRequest', { start: true, flags: flags, conversation_id: opts.conversation_id || '', wake_word_phrase: '' });
+  s.flags = type === 'ptt' ? 0 : type === 'wake' ? (E.VA_REQUEST_FLAG.USE_WAKE_WORD | E.VA_REQUEST_FLAG.USE_VAD) : E.VA_REQUEST_FLAG.USE_VAD;
+  s.conversationId = opts.conversation_id || '';
+  // While an aborted run is still winding down, hold the request (the mic already buffers audio).
+  if (staleUntil && Date.now() < staleUntil) { s.deferred = true; clearTimeout(staleTimer); staleTimer = setTimeout(staleClear, staleUntil - Date.now()); }
+  else sendStart(s);
   var onData = function (pcm) { onMicData(s, pcm); };
   if (type === 'ptt' || !usb.source) {
     s.mic = new Mic(onData, null, function (why) {
@@ -485,12 +528,28 @@ function finishAudio(why) {
   }, s.ptt ? 250 : 0);
 }
 
+// After we abort a run, HA still sends that run's last events (ERROR/RUN_END). They must not be taken
+// for events of the session that replaced it (e.g. the remote button aborting hands-free listening).
+var staleUntil = 0, staleTimer = null;
+
+function sendStart(s) {
+  s.deferred = false;
+  s.client.send('VoiceAssistantRequest', { start: true, flags: s.flags, conversation_id: s.conversationId || '', wake_word_phrase: '' });
+}
+function staleClear() {
+  staleUntil = 0; clearTimeout(staleTimer);
+  if (session && session.deferred && !session.client.sock.destroyed) sendStart(session);
+}
+
 function abortSession(why) {
   var s = session;
   if (!s) return;
   clearTimeout(s.maxTimer);
   if (!s.audioEnded) { s.audioEnded = true; s.mic.close(); }
-  if (s.client && !s.client.sock.destroyed) s.client.send('VoiceAssistantRequest', { start: false });
+  if (s.client && !s.client.sock.destroyed) {
+    s.client.send('VoiceAssistantRequest', { start: false });
+    staleUntil = Date.now() + 1000;
+  }
   endSession(why);
 }
 
@@ -523,6 +582,13 @@ function evData(m) { var d = {}; (m.data || []).forEach(function (x) { d[x.name]
 function onVaEvent(client, m) {
   var type = E.VA_EVENT[m.event_type], d = evData(m), s = session;
   var quiet = s && s.type === 'wake' && !s.woke && /^(RUN_START|WAKE_WORD_START)$/.test(type);
+  if (staleUntil) {
+    if (Date.now() > staleUntil) staleClear();
+    else {
+      if (type === 'RUN_END') staleClear();       // the aborted run is over
+      return;                                      // a new session's request isn't sent yet, so this is old
+    }
+  }
   if (type !== 'INTENT_PROGRESS' && !quiet) log('va event', type, JSON.stringify(d).slice(0, 200));
   if (!s || client !== s.client) return;
   switch (type) {
@@ -533,6 +599,7 @@ function onVaEvent(client, m) {
       s.maxTimer = setTimeout(function () { finishAudio('max length'); }, CFG.max_seconds * 1000);
       stopPlayback(true);
       duckTv();
+      if (CFG.wake_screen !== false && screen.on === false) setScreen(true, 'wake word');
       toast('🎙️ Słucham…');
       break;
     case 'STT_VAD_END': if (!s.ptt) finishAudio('vad'); break;
@@ -611,6 +678,7 @@ function pttUp() {
 
 checkUsbMic();
 setInterval(checkUsbMic, 15000);
+watchScreen();
 
 // ------------------------------------------------------------------ mDNS
 var mdns = new Mdns({ instance: CFG.name, host: CFG.name, ip: NET.ip, port: CFG.port,

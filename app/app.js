@@ -40,6 +40,8 @@
       : !handsOn ? micName + ' — tryb wyłączony'
       : (d.listening ? '● nasłuchuje „Okay Nabu” — ' : '') + micName;
     $('b-hands').textContent = 'Bez pilota: ' + (handsOn ? 'wł.' : 'wył.');
+    $('b-wscreen').textContent = 'Ekran po słowie: ' + ((!s.settings || s.settings.wake_screen !== false) ? 'wł.' : 'wył.');
+    $('b-wscreen').className = 'btn' + (d.usbMic && handsOn ? '' : ' hidden');
     var reply = d.lastReply || (d.lastError ? '⚠ ' + d.lastError : '');
     if (/problem getting a response|RESOURCE_EXHAUSTED|Unable to get response/.test(reply)) reply = 'Asystent AI chwilowo niedostępny — działają komendy lokalne';
     state.full = 'Ty: ' + (d.lastText || '—') + '\n\nAsystent: ' + (reply || '—') + (d.lastError ? '\n\nOstatni błąd: ' + d.lastError : '');
@@ -114,6 +116,10 @@
     },
     log: function () { state.showLog = !state.showLog; refresh(); },
     detail: function () { openDetail(); },
+    wscreen: function () {
+      var cur = !(state.status && state.status.settings && state.status.settings.wake_screen === false);
+      luna(SVC + 'setSettings', { wake_screen: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 4000); });
+    },
     hands: function () {
       var cur = !(state.status && state.status.settings && state.status.settings.hands_free === false);
       msg(cur ? 'Wyłączam tryb bez pilota…' : 'Włączam tryb bez pilota…');
