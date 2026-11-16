@@ -74,14 +74,12 @@
     $('b-toggle').textContent = s.enabled ? 'Wyłącz' : 'Włącz';
     var toasts = !s.settings || s.settings.toasts !== false;
     $('b-toasts').textContent = 'Dymki: ' + (toasts ? 'wł.' : 'wył.');
-    $('b-log').textContent = state.showLog ? 'Ukryj log' : 'Pokaż log';
-    if (state.showLog) { $('log').style.display = 'block'; $('log').textContent = s.log || '(pusty)'; }
-    else $('log').style.display = 'none';
+
     fixFocus();
   }
 
   function refresh() {
-    luna(SVC + 'status', { log: state.showLog ? 18 : 0 }, function (r) {
+    luna(SVC + 'status', {}, function (r) {
       if (r.returnValue === false && !r.root) {
         render({ root: false, enabled: true, running: false, daemon: {}, settings: {} });
         if (r.errorText && !/root/.test(r.errorText)) msg('Usługa: ' + r.errorText);
@@ -114,7 +112,7 @@
       var cur = !(state.status && state.status.settings && state.status.settings.toasts === false);
       luna(SVC + 'setSettings', { toasts: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 1500); });
     },
-    log: function () { state.showLog = !state.showLog; refresh(); },
+    log: function () { openLog(); },
     detail: function () { openDetail(); },
     wscreen: function () {
       var cur = !(state.status && state.status.settings && state.status.settings.wake_screen === false);
@@ -144,27 +142,40 @@
     Array.prototype.forEach.call(document.querySelectorAll('.btn'), function (b) { b.className = b.className.replace(/\s*focus/g, ''); });
     if (bs[focusIdx]) bs[focusIdx].className += ' focus';
   }
-  // ---------------- full-text panel (scrollable with up/down)
-  var detailOpen = false, detailY = 0;
-  function openDetail() {
-    detailOpen = true; detailY = 0;
-    $('detailText').textContent = state.full || '—';
-    $('detailText').style.transform = 'translateY(0)';
-    $('detail').className = '';
+  // ---------------- scrollable full-screen panel (last conversation / log)
+  var panel = null, panelY = 0;   // panel: { kind: 'detail'|'log' }
+  function showPanel(kind, title, text, toEnd) {
+    panel = { kind: kind };
+    $('detailTitle').textContent = title;
+    $('detailFoot').textContent = kind === 'log'
+      ? '▲▼ przewijanie · P+/P− cała strona · OK odśwież · Wstecz zamyka'
+      : '▲▼ przewijanie · OK / Wstecz zamyka';
+    $('detailText').textContent = text || '—';
+    $('detail').className = kind === 'log' ? 'log' : '';
+    panelY = toEnd ? 1e9 : 0;
+    scrollPanel(0);
   }
-  function closeDetail() { detailOpen = false; $('detail').className = 'hidden'; }
-  function scrollDetail(dir) {
+  function closePanel() { panel = null; $('detail').className = 'hidden'; }
+  function scrollPanel(delta) {
     var box = $('detail').querySelector('.body'), inner = $('detailText');
     var max = Math.max(0, inner.offsetHeight - box.clientHeight);
-    detailY = Math.max(0, Math.min(max, detailY + dir * 120));
-    inner.style.transform = 'translateY(' + (-detailY) + 'px)';
+    panelY = Math.max(0, Math.min(max, panelY + delta));
+    inner.style.transform = 'translateY(' + (-panelY) + 'px)';
+  }
+  function openDetail() { showPanel('detail', 'Ostatnia rozmowa', state.full, false); }
+  function openLog() {
+    luna(SVC + 'status', { log: 200 }, function (r) { showPanel('log', 'Log usługi (ostatnie 200 linii)', r.log || '(pusty)', true); });
   }
 
   document.addEventListener('keydown', function (e) {
-    if (detailOpen) {
-      if (e.keyCode === 38) scrollDetail(-1);
-      else if (e.keyCode === 40) scrollDetail(1);
-      else if (e.keyCode === 13 || e.keyCode === 461 || e.keyCode === 27) closeDetail();
+    if (panel) {
+      var page = $('detail').querySelector('.body').clientHeight - 40;
+      if (e.keyCode === 38) scrollPanel(-120);
+      else if (e.keyCode === 40) scrollPanel(120);
+      else if (e.keyCode === 33) scrollPanel(-page);            // channel up / page up
+      else if (e.keyCode === 34) scrollPanel(page);             // channel down / page down
+      else if (e.keyCode === 13 && panel.kind === 'log') openLog();
+      else if (e.keyCode === 13 || e.keyCode === 461 || e.keyCode === 27) closePanel();
       e.preventDefault();
       return;
     }
@@ -185,10 +196,19 @@
     b.addEventListener('mouseover', function () { focusIdx = visibleButtons().indexOf(b); fixFocus(); });   // Magic Remote pointer
   });
 
+  document.addEventListener('wheel', function (e) { if (panel) { scrollPanel(e.deltaY > 0 ? 120 : -120); e.preventDefault(); } });
+
   // first run: if we have root but the service was never started, start it
   luna(SVC + 'status', {}, function (r) {
     if (r.root && r.enabled && !r.running) luna(SVC + 'start', {}, function () { refresh(); });
     else render(r.returnValue === false ? { root: false, enabled: true, running: false, daemon: {}, settings: {} } : r);
   });
   setInterval(refresh, 3000);
+
+  // launch parameter {"panel":"log"|"detail"} opens a panel directly (handy for testing)
+  try {
+    var lp = window.PalmSystem && PalmSystem.launchParams ? JSON.parse(PalmSystem.launchParams || '{}') : {};
+    if (lp.panel === 'log') setTimeout(openLog, 800);
+    else if (lp.panel === 'detail') setTimeout(openDetail, 800);
+  } catch (e) {}
 })();

@@ -15,7 +15,7 @@ var net = require('net'), fs = require('fs'), path = require('path'), os = requi
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.5.2';
+var VERSION = '0.5.3';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 var LOG = '/tmp/lgtv-assist.log';
 var STATUS = '/tmp/lgtv-assist.status.json';
