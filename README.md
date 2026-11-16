@@ -20,20 +20,22 @@ Tested on: LG OLED55CX (webOS 5.6.2, root via Homebrew Channel), Magic Remote MR
 
 ## Layout
 ```
-app/                                  webOS app (UI) — packaged into the .ipk
+app/                                  packaged into the .ipk
+  index.html, app.js                  webOS app (UI)
+  daemon/satellite.js                 ESPHome satellite daemon (Node 8, no npm deps)
+  daemon/lib/{pb,messages,mdns}.js    protobuf codec, API message subset, mDNS responder
+  daemon/{autostart,loop,stop,init-hook}.sh
   services/io.github.xrogers.lgtvassist.service/
     service.js                        luna service: status/start/stop/restart/setSettings (runs as root)
-    daemon/satellite.js               ESPHome satellite daemon (Node 8, no npm deps)
-    daemon/lib/{pb,messages,mdns}.js  protobuf codec, API message subset, mDNS responder
-    daemon/{autostart,loop,stop,init-hook}.sh
-tools/build_ipk.py                    builds dist/*.ipk (no ares-cli needed)
+tools/build_ipk.py                    builds dist/*.ipk + the Homebrew Channel manifest (no ares-cli needed)
 tools/make_icons.py                   draws the icons
 legacy/                               first prototype (TV → HA WebSocket with a token)
+.github/workflows/release.yml         CI build; a tag vX.Y.Z publishes a GitHub release
 ```
 
 ## Build and install (local)
 ```sh
-python3 tools/build_ipk.py                      # → dist/io.github.xrogers.lgtvassist_<ver>_all.ipk
+python3 tools/build_ipk.py                      # → dist/io.github.xrogers.lgtvassist_<ver>_all.ipk (+ manifest)
 scp dist/*.ipk root@TV:/tmp/lgtvassist.ipk
 ssh root@TV 'luna-send -i luna://com.webos.appInstallService/dev/install \
   "{\"id\":\"com.ares.defaultName\",\"ipkUrl\":\"/tmp/lgtvassist.ipk\",\"subscribe\":true}"'
@@ -42,6 +44,17 @@ Open the app on the TV. On the first run (and after each reinstall) choose **Nad
 the app calls `org.webosbrew.hbchannel.service/elevateService` and starts the service, which installs the boot hook
 `/var/lib/webosbrew/init.d/60-lgtv-assist`. Then in HA go to **Settings → Devices & services**, where the TV appears as a
 discovered ESPHome device ("LG TV"). To add it manually, use ESPHome with host = TV IP, port 6053 and no key.
+
+## Releases
+The version is kept in three places, and the build fails if they differ: `app/appinfo.json`,
+`app/services/*/package.json` and `VERSION` in `app/daemon/satellite.js`.
+```sh
+git tag v0.5.4 && git push origin v0.5.4       # the tag must match that version
+```
+The workflow then publishes `io.github.xrogers.lgtvassist_<ver>_all.ipk`, `io.github.xrogers.lgtvassist.manifest.json`
+and `SHA256SUMS` as a GitHub release. The manifest is what a Homebrew Channel repository entry points at
+(`https://github.com/xrogers/lgvoiceassist/releases/latest/download/io.github.xrogers.lgtvassist.manifest.json`).
+Builds are reproducible: the commit time is used as the timestamp of every archive entry.
 
 ## Notes
 - Don't enable the "voice" block in *Life's Good Without Spying*: it also stubs `voiceinput`, which the app needs.

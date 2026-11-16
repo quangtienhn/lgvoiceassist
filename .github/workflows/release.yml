@@ -1,0 +1,102 @@
+name: Release
+
+# Every push and pull request builds the .ipk and the Homebrew Channel manifest (kept as a
+# workflow artifact). Pushing a tag vX.Y.Z also publishes both as a GitHub release, which is
+# what the manifestUrl in webosbrew/apps-repo points at:
+#   https://github.com/<owner>/<repo>/releases/latest/download/io.github.xrogers.lgtvassist.manifest.json
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Oldest webOS release the app claims to support; the compatibility report is limited to it.
+  # Keep in step with requirements.webosRelease in the apps-repo package file.
+  WEBOS_RELEASE: '>=5.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Syntax check
+        run: |
+          for f in app/app.js app/daemon/*.js app/daemon/lib/*.js app/services/*/service.js; do node --check "$f"; done
+          for f in app/daemon/*.sh; do sh -n "$f"; done
+          python3 -c "import json,sys; [json.load(open(f)) for f in sys.argv[1:]]" app/appinfo.json app/services/*/*.json
+
+      - name: Build IPK and manifest
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          # commit time as the archive timestamp: the same commit always gives the same .ipk
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" python3 tools/build_ipk.py
+          (cd dist && sha256sum *.ipk | tee SHA256SUMS)
+          {
+            echo '### Build'
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo '```json'
+            cat dist/*.manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The same check webosbrew/apps-repo runs on a submission. It only reports here (the
+      # tool and its firmware data are downloaded from a third party and must not be able
+      # to block a release), except for a package that no TV would install.
+      - name: Compatibility report (webosbrew-ipk-verify)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release download --repo webosbrew/dev-toolbox-cli --dir "$RUNNER_TEMP/toolbox" \
+                 --pattern 'webosbrew-toolbox-ipk-verify_*_amd64.deb' --pattern 'webosbrew-toolbox-fw-symbols_*_amd64.deb' \
+             || ! sudo apt-get install -y "$RUNNER_TEMP"/toolbox/*.deb >/dev/null; then
+            echo '::warning::webosbrew toolbox could not be installed; compatibility report skipped'
+            exit 0
+          fi
+          code=0
+          webosbrew-ipk-verify --format markdown --details --fw-releases "$WEBOS_RELEASE" dist/*.ipk > "$RUNNER_TEMP/compat.md" || code=$?
+          { echo '### Compatibility'; cat "$RUNNER_TEMP/compat.md"; } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/compat.md"
+          case "$code" in
+            0) ;;
+            1) echo "::warning::webosbrew-ipk-verify reports an incompatibility for webOS $WEBOS_RELEASE (see the job summary)" ;;
+            6) echo '::error::webosbrew-ipk-verify: the package is built in a way no TV will install'; exit 1 ;;
+            *) echo "::warning::webosbrew-ipk-verify could not complete (exit $code)" ;;
+          esac
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lgtvassist-ipk
+          path: |
+            dist/*.ipk
+            dist/*.manifest.json
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: lgtvassist-ipk
+          path: dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "LG TV Assist $TAG" --generate-notes \
+            dist/*.ipk dist/*.manifest.json dist/SHA256SUMS

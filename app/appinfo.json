@@ -5,6 +5,7 @@
   "type": "web",
   "main": "index.html",
   "title": "LG TV Assist",
+  "appDescription": "Home Assistant voice satellite: talk to Assist with the Magic Remote mic",
   "icon": "icon.png",
   "largeIcon": "largeIcon.png",
   "iconColor": "#03a9f4",
