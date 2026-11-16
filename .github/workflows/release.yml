@@ -25,9 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Syntax check
+      - name: Syntax and translation check
         run: |
-          for f in app/app.js app/daemon/*.js app/daemon/lib/*.js app/services/*/service.js; do node --check "$f"; done
+          for f in app/*.js app/daemon/*.js app/daemon/lib/*.js app/services/*/service.js tools/*.js; do node --check "$f"; done
+          node tools/check_i18n.js
           for f in app/daemon/*.sh; do sh -n "$f"; done
           python3 -c "import json,sys; [json.load(open(f)) for f in sys.argv[1:]]" app/appinfo.json app/services/*/*.json
 

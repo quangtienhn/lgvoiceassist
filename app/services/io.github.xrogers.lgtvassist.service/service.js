@@ -138,11 +138,15 @@ service.register('setSettings', function (message) {
   if (needRoot(message)) return;
   var p = message.payload || {}, file = path.join(DATA, 'settings.json');
   var s = readJson(file, {});
-  ['friendly_name', 'name', 'toasts', 'suggested_area', 'max_seconds', 'hands_free', 'mic_gain', 'duck', 'duck_volume', 'wake_screen'].forEach(function (k) {
+  ['friendly_name', 'name', 'toasts', 'suggested_area', 'max_seconds', 'hands_free', 'mic_gain', 'duck', 'duck_volume', 'wake_screen', 'lang', 'tv_locale'].forEach(function (k) {
     if (p[k] !== undefined) s[k] = p[k];
   });
   if (s.name) s.name = String(s.name).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 31);
   if (s.toasts !== undefined && s.toasts !== true && s.toasts !== false && s.toasts !== 'listen') s.toasts = true;
+  // lang: a two-letter code the user chose in the app; anything else ("auto") means follow the TV menu language,
+  // which the app reports as tv_locale (e.g. "pl-PL")
+  if (s.lang !== undefined && !/^[a-z]{2}$/.test(String(s.lang))) delete s.lang;
+  if (s.tv_locale !== undefined && !/^[A-Za-z_-]{2,16}$/.test(String(s.tv_locale))) delete s.tv_locale;
   try { fs.mkdirSync(DATA); } catch (e) {}
   var prev = readJson(file, {});
   fs.writeFileSync(file, JSON.stringify(s, null, 1));

@@ -4,6 +4,9 @@ Home Assistant voice satellite for rooted LG webOS TVs: push-to-talk with the **
 Home Assistant connects to the TV over the **ESPHome native API**, so there is no token or login on the TV.
 The TV shows up in HA as an `assist_satellite` with a pipeline selector, area, announcements and timers.
 
+The app, its toasts on the TV and the entity names follow the TV menu language: **English, Polish, German, Spanish**
+(English for anything else); the language can also be picked in the app.
+
 Tested on: LG OLED55CX (webOS 5.6.2, root via Homebrew Channel), Magic Remote MR20 (BLE), HA 2026.11.
 
 ## How it works
@@ -22,12 +25,14 @@ Tested on: LG OLED55CX (webOS 5.6.2, root via Homebrew Channel), Magic Remote MR
 ```
 app/                                  packaged into the .ipk
   index.html, app.js                  webOS app (UI)
+  i18n.js                             translations, shared by the UI and the daemon
   daemon/satellite.js                 ESPHome satellite daemon (Node 8, no npm deps)
   daemon/lib/{pb,messages,mdns}.js    protobuf codec, API message subset, mDNS responder
   daemon/{autostart,loop,stop,init-hook}.sh
   services/io.github.xrogers.lgtvassist.service/
     service.js                        luna service: status/start/stop/restart/setSettings (runs as root)
 tools/build_ipk.py                    builds dist/*.ipk + the Homebrew Channel manifest (no ares-cli needed)
+tools/check_i18n.js                   checks that all translations are complete and used
 tools/make_icons.py                   draws the icons
 legacy/                               first prototype (TV → HA WebSocket with a token)
 .github/workflows/release.yml         CI build; a tag vX.Y.Z publishes a GitHub release
@@ -45,6 +50,12 @@ the app calls `org.webosbrew.hbchannel.service/elevateService` and starts the se
 `/var/lib/webosbrew/init.d/60-lgtv-assist`. Then in HA go to **Settings → Devices & services**, where the TV appears as a
 discovered ESPHome device ("LG TV"). To add it manually, use ESPHome with host = TV IP, port 6053 and no key.
 
+## Translations
+All texts live in `app/i18n.js`. To add a language, copy the `en` block under a new two-letter code, translate the
+values (keep the `{placeholders}` and `<b>` tags), add the code to `LANGS` and its name to `NAMES`, then run
+`node tools/check_i18n.js`. The language is the one chosen in the app, otherwise the TV menu language
+(`localeInfo.locales.UI` from LG's settings service, or the locale the app reported when it was last opened).
+
 ## Releases
 The version is kept in three places, and the build fails if they differ: `app/appinfo.json`,
 `app/services/*/package.json` and `VERSION` in `app/daemon/satellite.js`.
@@ -57,7 +68,6 @@ and `SHA256SUMS` as a GitHub release. The manifest is what a Homebrew Channel re
 Builds are reproducible: the commit time is used as the timestamp of every archive entry.
 
 ## Notes
-- Don't enable the "voice" block in *Life's Good Without Spying*: it also stubs `voiceinput`, which the app needs.
 - Children are started through `spawnClean` (closes inherited fds); otherwise a lingering child keeps the luna hub
   socket and the voiceconductor name stays "already exists" after a restart.
 - Turning the app off (or uninstalling it and rebooting) gives the mic button back to LG's assistant.

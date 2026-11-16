@@ -7,12 +7,14 @@
 //  * Audio: LG's voiceinput streams the remote mic (HID F9 03 / F9 04, mSBC decoded by LG) as raw
 //    PCM s16le 16 kHz mono on a unix socket; we forward it as VoiceAssistantAudio.
 //  * Replies, announcements and media_player URLs are played with mpg123 (MP3) or gst-play-1.0.
+//  * Toasts and the entity name follow the TV menu language (English, Polish, German, Spanish).
 //
 // Node 8 (TV firmware), no npm dependencies. Runs as root (needs luna name + LG service control).
 'use strict';
 var palmbus = require('palmbus');
 var net = require('net'), fs = require('fs'), path = require('path'), os = require('os'), cp = require('child_process');
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
+var I18N = require('../i18n');   // translations shared with the app UI (app folder)
 var M = msgs.M, E = msgs.E;
 
 var VERSION = '0.5.4';
@@ -69,6 +71,28 @@ function toast(text, kind) {
   if (CFG.toasts === 'listen' && kind !== 'listen') return;
   lunaSend('luna://com.webos.notification/createToast',
     { message: String(text).slice(0, 180), sourceId: 'com.webos.service.voiceconductor', noaction: true });
+}
+
+// ------------------------------------------------------------------ language
+// CFG.lang: a language picked in the app. Otherwise the TV menu language: from LG's settings service
+// (live, see watchLocale) or, failing that, as the app reported it when it was last opened (CFG.tv_locale).
+var tvLocale = null;
+function lang() { return I18N.resolve(CFG.lang, tvLocale || CFG.tv_locale); }
+function T(key, params) { return I18N.t(lang(), key, params); }
+function watchLocale(onFirst) {
+  var p = spawnClean('luna-send', ['-i', 'luna://com.webos.settingsservice/getSystemSettings', '{"keys":["localeInfo"],"subscribe":true}']);
+  var buf = '';
+  p.stdout.on('data', function (d) {
+    buf = (buf + d).slice(-8192);
+    var re = /"UI"\s*:\s*"([A-Za-z_-]+)"/g, m, last = null, end = 0;   // localeInfo.locales.UI, e.g. "pl-PL"
+    while ((m = re.exec(buf))) { last = m[1]; end = re.lastIndex; }
+    if (!last) return;
+    buf = buf.slice(end);
+    if (last !== tvLocale) { tvLocale = last; log('language: TV menu', last, '->', lang()); }
+    if (onFirst) { var cb = onFirst; onFirst = null; cb(); }
+  });
+  p.on('error', function () {});
+  p.on('exit', function () { setTimeout(function () { watchLocale(onFirst); }, 30000); });
 }
 
 // ------------------------------------------------------------------ luna: be "voiceconductor"
@@ -291,7 +315,7 @@ Client.prototype.handle = function (name, m) {
         supported_formats: [{ format: 'mp3', purpose: 0 }, { format: 'mp3', purpose: 1 }],
         feature_flags: E.MP_FEATURE.PLAY | E.MP_FEATURE.STOP | E.MP_FEATURE.PLAY_MEDIA | E.MP_FEATURE.VOLUME_SET |
           E.MP_FEATURE.VOLUME_MUTE | E.MP_FEATURE.MEDIA_ANNOUNCE });
-      this.send('ListEntitiesSwitchResponse', { object_id: 'lg_tv_screen', key: SCREEN_KEY, name: 'Ekran', icon: 'mdi:television' });
+      this.send('ListEntitiesSwitchResponse', { object_id: 'lg_tv_screen', key: SCREEN_KEY, name: T('d_entity_screen'), icon: 'mdi:television' });
       return this.send('ListEntitiesDoneResponse', {});
     case 'SubscribeStatesRequest':
     case 'SubscribeHomeAssistantStatesRequest':
@@ -347,7 +371,17 @@ var server = net.createServer(function (sock) {
   sock.on('close', function () { log('api: closed', sock.remoteAddress); c.closed(); });
 });
 server.on('error', function (e) { log('api server error', e.message); process.exit(1); });
-server.listen(CFG.port, '0.0.0.0', function () { log('api: listening on', CFG.port); });
+// The entity name is translated, so learn the TV language before Home Assistant can list entities:
+// listen on the first answer from the settings service, at once if the language is already known
+// from the settings, and after 2 s at the latest.
+var listenStarted = false;
+function listen() {
+  if (listenStarted) return;
+  listenStarted = true;
+  server.listen(CFG.port, '0.0.0.0', function () { log('api: listening on', CFG.port); });
+}
+watchLocale(listen);
+if (CFG.lang || CFG.tv_locale) listen(); else setTimeout(listen, 2000);
 
 // ------------------------------------------------------------------ USB microphone (hands-free)
 // A USB microphone shows up in LG's PulseAudio as alsa_input.usb-*. We read it with parec (16 kHz mono)
@@ -468,7 +502,7 @@ var session = null, listenTimer = null, listenBackoff = 0;
 
 function startSession(opts) {
   if (session) return;
-  if (!va) { if (opts.type !== 'wake') toast('Home Assistant nie jest połączony z telewizorem'); return; }
+  if (!va) { if (opts.type !== 'wake') toast(T('d_no_ha')); return; }
   var type = opts.type || 'ptt';
   var s = session = { type: type, ptt: type === 'ptt', started: false, audioEnded: false, buf: [], bytes: 0, t0: Date.now(),
     client: va, woke: false };
@@ -482,8 +516,8 @@ function startSession(opts) {
   var onData = function (pcm) { onMicData(s, pcm); };
   if (type === 'ptt' || !usb.source) {
     s.mic = new Mic(onData, null, function (why) {
-      if (type === 'ptt') toast('Mikrofon pilota niedostępny');
-      else if (type === 'vad') toast('Naciśnij mikrofon na pilocie, aby odpowiedzieć');
+      if (type === 'ptt') toast(T('d_mic_unavailable'));
+      else if (type === 'vad') toast(T('d_press_to_answer'));
       abortSession('mic: ' + why);
     });
   } else {
@@ -507,7 +541,7 @@ function onVaResponse(client, m) {
   if (!s || client !== s.client) return;
   if (m.error) {
     log('va: HA could not start the pipeline');
-    if (s.type !== 'wake') toast('Asystent HA niedostępny');
+    if (s.type !== 'wake') toast(T('d_assist_unavailable'));
     listenBackoff = Date.now() + 30000;
     return abortSession('ha error');
   }
@@ -526,7 +560,7 @@ function finishAudio(why) {
     s.audioEnded = true;
     s.mic.close();
     log('va: audio end (' + why + '),', (s.bytes / 32000).toFixed(1), 's');
-    if (s.ptt && s.bytes < 8000) { toast('Przytrzymaj przycisk mikrofonu i mów'); return abortSession('too short'); }
+    if (s.ptt && s.bytes < 8000) { toast(T('d_hold_and_speak')); return abortSession('too short'); }
     if (s.started) s.client.send('VoiceAssistantAudio', { end: true });
   }, s.ptt ? 250 : 0);
 }
@@ -603,7 +637,7 @@ function onVaEvent(client, m) {
       stopPlayback(true);
       duckTv();
       if (CFG.wake_screen !== false && screen.on === false) setScreen(true, 'wake word');
-      toast('🎙️ Słucham…', 'listen');
+      toast(T('d_listening'), 'listen');
       break;
     case 'STT_VAD_END': if (!s.ptt) finishAudio('vad'); break;
     case 'STT_END':
@@ -619,7 +653,7 @@ function onVaEvent(client, m) {
       // LLM/conversation agent errors come back as English error dumps: show a short note, don't speak them
       if (d.text && /problem getting a response|RESOURCE_EXHAUSTED|Unable to get response/.test(d.text)) {
         s.muteTts = true;
-        d.text = 'Asystent AI chwilowo niedostępny — działają komendy lokalne';
+        d.text = T('ai_unavailable');
       }
       status.lastReply = d.text; saveStatus();
       if (d.text) toast(d.text);
@@ -638,7 +672,7 @@ function onVaEvent(client, m) {
     case 'ERROR':
       status.lastError = (d.code || '') + ' ' + (d.message || ''); saveStatus();
       if (s.type === 'wake' && !s.woke) { log('va: wake word stage error', d.code); listenBackoff = Date.now() + 10000; break; }
-      toast(d.code === 'stt-no-text-recognized' ? 'Nie usłyszałem polecenia' : 'Asystent: ' + (d.message || d.code));
+      toast(d.code === 'stt-no-text-recognized' ? T('d_not_heard') : T('d_assistant_error', { msg: d.message || d.code }));
       break;
     case 'RUN_END':
       endSession('run end');
@@ -660,8 +694,9 @@ function onAnnounce(client, m) {
 function onTimer(m) {
   var t = E.TIMER_EVENT[m.event_type];
   log('timer', t, m.name || '', m.seconds_left);
-  if (t === 'FINISHED') toast('⏰ ' + (m.name ? 'Minutnik „' + m.name + '” zakończony' : 'Minutnik zakończony'));
-  else if (t === 'STARTED') toast('⏱️ Minutnik' + (m.name ? ' „' + m.name + '”' : '') + ': ' + Math.round(m.total_seconds / 60) + ' min');
+  var min = Math.round(m.total_seconds / 60);
+  if (t === 'FINISHED') toast(m.name ? T('d_timer_done_named', { name: m.name }) : T('d_timer_done'));
+  else if (t === 'STARTED') toast(m.name ? T('d_timer_started_named', { name: m.name, min: min }) : T('d_timer_started', { min: min }));
 }
 
 // ------------------------------------------------------------------ push-to-talk
@@ -679,14 +714,17 @@ function pttUp() {
   if (session && session.ptt) finishAudio('key up');
 }
 
-// Live settings: toasts / hands_free / wake_screen / duck / mic_gain apply without a restart
+// Live settings: toasts / hands_free / wake_screen / duck / mic_gain / language apply without a restart
 // (the service restarts the daemon only when the name or port changes).
 var SETTINGS = path.join(DATA_DIR, 'settings.json');
 fs.watchFile(SETTINGS, { interval: 1000 }, function () {
   var next = readJson(SETTINGS, {});
-  ['toasts', 'hands_free', 'wake_screen', 'duck', 'duck_volume', 'mic_gain', 'max_seconds'].forEach(function (k) {
+  ['toasts', 'hands_free', 'wake_screen', 'duck', 'duck_volume', 'mic_gain', 'max_seconds', 'tv_locale'].forEach(function (k) {
     if (next[k] !== undefined && next[k] !== CFG[k]) { log('settings:', k, '=', JSON.stringify(next[k])); CFG[k] = next[k]; }
   });
+  // "lang" is removed from the file when the user goes back to automatic, so compare it as it is
+  // (but not when the file could not be read at all, e.g. while it is being written)
+  if (Object.keys(next).length && next.lang !== CFG.lang) { CFG.lang = next.lang; log('settings: lang =', next.lang || 'auto', '->', lang()); }
   if (usb.source && next.mic_gain !== undefined) configureUsbMic(usb.source);
   if (CFG.hands_free === false && session && session.type === 'wake' && !session.woke) abortSession('hands-free off');
   else scheduleListening(300);

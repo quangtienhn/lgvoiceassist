@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="pl">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>LG TV Assist</title>
@@ -52,7 +52,7 @@
 </style>
 </head>
 <body>
-<div class="wrap">
+<div class="wrap" id="wrap">
   <header>
     <img src="icon.png" alt="">
     <h1>LG TV Assist</h1>
@@ -60,12 +60,12 @@
   </header>
 
   <div class="grid">
-    <div class="card" id="c-service"><div class="k">Usługa na telewizorze</div><div class="v"><span class="dot"></span><span id="service">…</span></div></div>
+    <div class="card" id="c-service"><div class="k" data-i18n="card_service"></div><div class="v"><span class="dot"></span><span id="service">…</span></div></div>
     <div class="card" id="c-ha"><div class="k">Home Assistant</div><div class="v"><span class="dot"></span><span id="ha">…</span></div></div>
-    <div class="card"><div class="k">Adres satelity ESPHome</div><div class="v" id="addr">…</div>
-      <div class="k" style="margin-top:14px">Mikrofon bez pilota (USB)</div><div class="v" id="usb" style="font-size:28px">…</div></div>
-    <div class="card"><div class="k">Ostatnia rozmowa</div>
-      <div class="last"><div><span class="who">Ty:</span><span class="txt" id="lastText">—</span></div><div><span class="who">Asystent:</span><span class="txt" id="lastReply">—</span></div></div>
+    <div class="card"><div class="k" data-i18n="card_addr"></div><div class="v" id="addr">…</div>
+      <div class="k" style="margin-top:14px" data-i18n="card_usb"></div><div class="v" id="usb" style="font-size:28px">…</div></div>
+    <div class="card"><div class="k" data-i18n="card_last"></div>
+      <div class="last"><div><span class="who" data-i18n="you"></span><span class="txt" id="lastText">—</span></div><div><span class="who" data-i18n="assistant"></span><span class="txt" id="lastReply">—</span></div></div>
     </div>
   </div>
 
@@ -73,20 +73,22 @@
   <div class="card hint" id="hint"></div>
 
   <div class="buttons" id="buttons">
-    <div class="btn" id="b-elevate" data-act="elevate">Nadaj uprawnienia (Homebrew)</div>
-    <div class="btn hidden" id="b-nospy" data-act="nospy">Otwórz Life's Good Without Spying</div>
-    <div class="btn" id="b-toggle" data-act="toggle">Wyłącz</div>
-    <div class="btn" id="b-restart" data-act="restart">Uruchom ponownie</div>
-    <div class="btn" id="b-hands" data-act="hands">Bez pilota: wł.</div>
-    <div class="btn" id="b-wscreen" data-act="wscreen">Ekran po słowie: wł.</div>
-    <div class="btn" id="b-toasts" data-act="toasts">Dymki: wł.</div>
-    <div class="btn" id="b-detail" data-act="detail">Pełna odpowiedź</div>
-    <div class="btn" id="b-log" data-act="log">Pokaż log</div>
+    <div class="btn" id="b-elevate" data-act="elevate" data-i18n="btn_elevate"></div>
+    <div class="btn hidden" id="b-nospy" data-act="nospy" data-i18n="btn_nospy"></div>
+    <div class="btn" id="b-toggle" data-act="toggle"></div>
+    <div class="btn" id="b-restart" data-act="restart" data-i18n="btn_restart"></div>
+    <div class="btn" id="b-hands" data-act="hands"></div>
+    <div class="btn" id="b-wscreen" data-act="wscreen"></div>
+    <div class="btn" id="b-toasts" data-act="toasts"></div>
+    <div class="btn" id="b-detail" data-act="detail" data-i18n="btn_detail"></div>
+    <div class="btn" id="b-log" data-act="log" data-i18n="btn_log"></div>
+    <div class="btn" id="b-lang" data-act="lang"></div>
   </div>
   <div class="msg" id="msg"></div>
 </div>
-<div id="detail" class="hidden"><h2 id="detailTitle">Ostatnia rozmowa</h2><div class="body"><div class="inner" id="detailText"></div></div>
+<div id="detail" class="hidden"><h2 id="detailTitle"></h2><div class="body"><div class="inner" id="detailText"></div></div>
   <div class="foot" id="detailFoot"></div></div>
+<script src="i18n.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
