@@ -1,7 +1,8 @@
 # LG TV Assist
 
 Home Assistant voice satellite for rooted LG webOS TVs: push-to-talk with the **Magic Remote mic**.
-Home Assistant connects to the TV over the **ESPHome native API**, so there is no token or login on the TV.
+Home Assistant connects to the TV over the **ESPHome native API**, so there is no token or login on the TV;
+the connection can be **encrypted** with a pre-shared key, like any ESPHome device.
 The TV shows up in HA as an `assist_satellite` with a pipeline selector, area, announcements and timers.
 
 The app, its toasts on the TV and the entity names follow the TV menu language: **English, Polish, German, Spanish**
@@ -17,7 +18,7 @@ Tested on: LG OLED55CX (webOS 5.6.2, root via Homebrew Channel), Magic Remote MR
    *through its own voiceconductor handle* (voiceinput only lets the starter stop: `stopStreaming`, otherwise "permission fail").
    voiceinput sends the remote the HID feature report `F9 03` (stop `F9 04`, keep-alive `F9 05` via `restartTimer`),
    decodes the remote's mSBC and serves raw **PCM s16le 16 kHz mono** on `/tmp/voiceinput_remote1.soc`.
-3. **Home Assistant:** ESPHome API server on port 6053 (plaintext) plus an mDNS responder for `_esphomelib._tcp`, so HA
+3. **Home Assistant:** ESPHome API server on port 6053 (plaintext or Noise-encrypted, see below) plus an mDNS responder for `_esphomelib._tcp`, so HA
    auto-discovers it. Push-to-talk: `VoiceAssistantRequest(start)` → `VoiceAssistantAudio` chunks → `VoiceAssistantAudio(end)` on release.
    Replies, announcements and media_player URLs play through `mpg123` (MP3 is declared as the supported format) or `gst-play-1.0`.
 
@@ -28,11 +29,13 @@ app/                                  packaged into the .ipk
   i18n.js                             translations, shared by the UI and the daemon
   daemon/satellite.js                 ESPHome satellite daemon (Node 8, no npm deps)
   daemon/lib/{pb,messages,mdns}.js    protobuf codec, API message subset, mDNS responder
+  daemon/lib/noise.js                 API encryption: X25519, ChaCha20-Poly1305, Noise handshake, framing
   daemon/{autostart,loop,stop,init-hook}.sh
   services/io.github.xrogers.lgtvassist.service/
     service.js                        luna service: status/start/stop/restart/setSettings (runs as root)
 tools/build_ipk.py                    builds dist/*.ipk + the Homebrew Channel manifest (no ares-cli needed)
 tools/check_i18n.js                   checks that all translations are complete and used
+tools/test_*.{js,py}, daemon_harness* tests (see below)
 tools/make_icons.py                   draws the icons
 legacy/                               first prototype (TV → HA WebSocket with a token)
 .github/workflows/release.yml         CI build; a tag vX.Y.Z publishes a GitHub release
@@ -48,7 +51,32 @@ ssh root@TV 'luna-send -i luna://com.webos.appInstallService/dev/install \
 Open the app on the TV. On the first run (and after each reinstall) choose **Nadaj uprawnienia (Homebrew)**:
 the app calls `org.webosbrew.hbchannel.service/elevateService` and starts the service, which installs the boot hook
 `/var/lib/webosbrew/init.d/60-lgtv-assist`. Then in HA go to **Settings → Devices & services**, where the TV appears as a
-discovered ESPHome device ("LG TV"). To add it manually, use ESPHome with host = TV IP, port 6053 and no key.
+discovered ESPHome device ("LG TV"). To add it manually, use ESPHome with host = TV IP, port 6053 and no key
+(or the key shown in the app once encryption is on).
+
+## Encryption
+Without encryption anyone on the home network can connect to port 6053, play media on the TV and, in hands-free
+mode, receive the microphone audio. Turn on **Encryption** in the app: the TV then accepts only
+`Noise_NNpsk0_25519_ChaChaPoly_SHA256` connections (the ESPHome API encryption) and shows the key, base64 of 32 bytes,
+made once on the TV. Home Assistant asks for it (a device that was already added shows *Reconfigure*); after turning
+encryption off again, Home Assistant asks to confirm that the key can go. The key lives in
+`/media/developer/lgtv-assist/settings.json` (`encryption`, `api_key`).
+
+The TV's Node 8 / OpenSSL 1.0.2 has neither X25519 nor ChaCha20-Poly1305, so both are implemented in plain JavaScript
+in `app/daemon/lib/noise.js` (X25519 after TweetNaCl, public domain). Not implemented: ESPHome's key provisioning by
+Home Assistant (`api_encryption_supported` is only announced while encryption is on).
+
+## Tests
+```sh
+node tools/check_i18n.js                 # translations complete and used
+node tools/test_noise.js                 # crypto test vectors (RFC 7748, RFC 8439), Noise handshake, framing; runs on Node 8
+python3 -m venv /tmp/venv && /tmp/venv/bin/pip install aioesphomeapi cryptography
+/tmp/venv/bin/python tools/test_interop.py      # the real daemon against the real Home Assistant client library
+/tmp/venv/bin/python tools/test_voice.py        # voice audio, events, announcements, languages; encrypted and plaintext
+/tmp/venv/bin/python tools/test_crypto_diff.py  # X25519 / ChaCha20-Poly1305 against OpenSSL on random inputs
+```
+`tools/daemon_harness.py` runs the unmodified daemon off-TV (stub `palmbus`, fake `luna-send`/`pactl`/`parec`, temp
+directories). `LGTV_NODE=/path/to/node` picks the Node binary, e.g. Node 8.12 as on the TV.
 
 ## Translations
 All texts live in `app/i18n.js`. To add a language, copy the `en` block under a new two-letter code, translate the
@@ -75,6 +103,6 @@ Builds are reproducible: the commit time is used as the timestamp of every archi
 - Remote protocol (MR20, BLE, `hidraw` only while awake): voice report `0xFE`, 124 B = `FE seq 80 8B` + 2 × (`01 H2` + 57 B mSBC + pad).
 
 ## TODO
-- ESPHome Noise encryption (needs pure-JS X25519 + ChaCha20-Poly1305: the TV's Node 8 / OpenSSL 1.0.2 lacks both).
+- Encryption key provisioning by Home Assistant (no key to type), as newer ESPHome devices do.
 - Start TTS playback early from the streaming URL in `RUN_START`.
-- Homebrew Channel repository manifest (root required) for one-click install and auto re-elevation.
+- Listing in the Homebrew Channel repository (webosbrew/apps-repo) for one-click install and auto re-elevation.

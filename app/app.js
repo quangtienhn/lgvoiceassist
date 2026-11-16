@@ -72,6 +72,12 @@
     $('b-hands').textContent = t('btn_hands', { v: onOff(handsOn) });
     $('b-wscreen').textContent = t('btn_wscreen', { v: onOff(set.wake_screen !== false) });
     $('b-wscreen').className = 'btn' + (d.usbMic && handsOn ? '' : ' hidden');
+    // encryption key: Home Assistant asks for it, so show it whenever encryption is on
+    var encOn = set.encryption === true;
+    $('b-enc').textContent = t('btn_enc', { v: onOff(encOn) });
+    $('b-enc').className = 'btn' + (s.root ? '' : ' hidden');
+    $('keyrow').className = encOn && set.api_key ? '' : 'hidden';
+    $('key').textContent = encOn && set.api_key ? set.api_key : '';
     var reply = d.lastReply || (d.lastError ? '⚠ ' + d.lastError : '');
     if (/problem getting a response|RESOURCE_EXHAUSTED|Unable to get response/.test(reply)) reply = t('ai_unavailable');
     state.full = t('you') + ' ' + (d.lastText || '—') + '\n\n' + t('assistant') + ' ' + (reply || '—') +
@@ -81,7 +87,8 @@
 
     var hint;
     if (!s.root) hint = t('hint_root');
-    else if (!connected) hint = t('hint_connect', { name: esc(set.friendly_name || 'LG TV'), ip: esc(d.ip || '?'), port: esc(d.port || 6053) });
+    else if (!connected) hint = t('hint_connect', { name: esc(set.friendly_name || 'LG TV'), ip: esc(d.ip || '?'), port: esc(d.port || 6053),
+      key: t(encOn ? 'key_shown' : 'key_none') });
     else if (d.usbMic && handsOn) hint = t('hint_handsfree');
     else hint = t('hint_ptt');
     $('hint').innerHTML = hint;
@@ -167,6 +174,13 @@
       if (!s.root) { state.localLang = next; render(s); return; }
       luna(SVC + 'setSettings', { lang: next }, function (r) {
         fail(r);
+        if (r.returnValue && r.settings) { s.settings = r.settings; render(s); }
+      });
+    },
+    enc: function () {
+      var s = state.status || NO_ROOT, cur = (s.settings || {}).encryption === true;
+      luna(SVC + 'setSettings', { encryption: !cur }, function (r) {
+        msg(r.returnValue ? t(cur ? 'msg_enc_off' : 'msg_enc_on') : t('msg_error', { err: r.errorText || '' }));
         if (r.returnValue && r.settings) { s.settings = r.settings; render(s); }
       });
     },

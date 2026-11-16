@@ -2,3 +2,4 @@
 token
 config.json
 dist/
+__pycache__/

@@ -82,9 +82,46 @@ jobs:
             dist/SHA256SUMS
           if-no-files-found: error
 
+  # The TV runs Node 8.12: check that everything that runs there parses and passes its tests on that version.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '8.12.0'
+      - name: Syntax on Node 8
+        run: |
+          node --version
+          for f in app/i18n.js app/daemon/*.js app/daemon/lib/*.js app/services/*/service.js; do node --check "$f"; done
+      - name: Crypto and protocol tests on Node 8
+        run: node tools/test_noise.js
+      - name: Translation check on Node 8
+        run: node tools/check_i18n.js
+
+  # The real daemon (on Node 8) against the real Home Assistant client library. Does not block a release:
+  # a new aioesphomeapi can break it from the outside.
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '8.12.0'
+      - name: Install the Home Assistant ESPHome client
+        run: python3 -m venv "$RUNNER_TEMP/venv" && "$RUNNER_TEMP/venv/bin/pip" install -q aioesphomeapi cryptography
+      - name: Interoperability (encryption, key errors, plaintext)
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" -c "import aioesphomeapi; print('aioesphomeapi', aioesphomeapi.__version__ if hasattr(aioesphomeapi, '__version__') else '')"
+          "$RUNNER_TEMP/venv/bin/python" tools/test_interop.py
+      - name: Voice audio, events and languages
+        run: '"$RUNNER_TEMP/venv/bin/python" tools/test_voice.py'
+      - name: Crypto against OpenSSL
+        run: '"$RUNNER_TEMP/venv/bin/python" tools/test_crypto_diff.py'
+
   release:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -2,7 +2,7 @@
 // Must run as root (elevated by Homebrew Channel) to take over the mic button and control LG services.
 'use strict';
 var Service = require('webos-service');
-var fs = require('fs'), path = require('path'), cp = require('child_process');
+var fs = require('fs'), path = require('path'), cp = require('child_process'), crypto = require('crypto');
 
 var ID = 'io.github.xrogers.lgtvassist.service';
 var APP_ID = 'io.github.xrogers.lgtvassist';
@@ -31,6 +31,7 @@ function installHook() {
   fs.writeFileSync(HOOK, fs.readFileSync(path.join(DAEMON, 'init-hook.sh')));
   fs.chmodSync(HOOK, 493);   // 0755
 }
+function validKey(k) { return typeof k === 'string' && /^[A-Za-z0-9+\/]{43}=$/.test(k) && Buffer.from(k, 'base64').length === 32; }
 function needRoot(message) {
   if (isRoot()) return false;
   message.respond({ returnValue: false, errorText: 'not running as root', notRoot: true });
@@ -138,7 +139,7 @@ service.register('setSettings', function (message) {
   if (needRoot(message)) return;
   var p = message.payload || {}, file = path.join(DATA, 'settings.json');
   var s = readJson(file, {});
-  ['friendly_name', 'name', 'toasts', 'suggested_area', 'max_seconds', 'hands_free', 'mic_gain', 'duck', 'duck_volume', 'wake_screen', 'lang', 'tv_locale'].forEach(function (k) {
+  ['friendly_name', 'name', 'toasts', 'suggested_area', 'max_seconds', 'hands_free', 'mic_gain', 'duck', 'duck_volume', 'wake_screen', 'lang', 'tv_locale', 'encryption'].forEach(function (k) {
     if (p[k] !== undefined) s[k] = p[k];
   });
   if (s.name) s.name = String(s.name).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 31);
@@ -147,11 +148,16 @@ service.register('setSettings', function (message) {
   // which the app reports as tv_locale (e.g. "pl-PL")
   if (s.lang !== undefined && !/^[a-z]{2}$/.test(String(s.lang))) delete s.lang;
   if (s.tv_locale !== undefined && !/^[A-Za-z_-]{2,16}$/.test(String(s.tv_locale))) delete s.tv_locale;
+  // encryption: the ESPHome API then only accepts Home Assistant with the pre-shared key (base64 of 32 bytes),
+  // which is made once, the first time encryption is turned on, and shown in the app
+  if (s.encryption !== undefined) s.encryption = s.encryption === true;
+  if (s.encryption && !validKey(s.api_key)) s.api_key = crypto.randomBytes(32).toString('base64');
   try { fs.mkdirSync(DATA); } catch (e) {}
   var prev = readJson(file, {});
   fs.writeFileSync(file, JSON.stringify(s, null, 1));
-  // the daemon picks up most settings live; identity changes (name/port) need a restart
-  var restart = prev.name !== s.name || prev.friendly_name !== s.friendly_name || prev.port !== s.port;
+  // the daemon picks up most settings live; identity (name/port) and encryption changes need a restart
+  var restart = prev.name !== s.name || prev.friendly_name !== s.friendly_name || prev.port !== s.port ||
+    !!prev.encryption !== !!s.encryption || (s.encryption && prev.api_key !== s.api_key);
   var pid = restart && alive('/tmp/lgtv-assist.daemon.pid');
   if (pid) { try { process.kill(pid, 'SIGTERM'); } catch (e) {} }
   message.respond({ returnValue: true, settings: s, restarted: !!pid });
