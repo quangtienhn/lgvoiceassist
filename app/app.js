@@ -40,8 +40,11 @@
       : !handsOn ? micName + ' — tryb wyłączony'
       : (d.listening ? '● nasłuchuje „Okay Nabu” — ' : '') + micName;
     $('b-hands').textContent = 'Bez pilota: ' + (handsOn ? 'wł.' : 'wył.');
+    var reply = d.lastReply || (d.lastError ? '⚠ ' + d.lastError : '');
+    if (/problem getting a response|RESOURCE_EXHAUSTED|Unable to get response/.test(reply)) reply = 'Asystent AI chwilowo niedostępny — działają komendy lokalne';
+    state.full = 'Ty: ' + (d.lastText || '—') + '\n\nAsystent: ' + (reply || '—') + (d.lastError ? '\n\nOstatni błąd: ' + d.lastError : '');
     $('lastText').textContent = d.lastText || '—';
-    $('lastReply').textContent = d.lastReply || (d.lastError ? '⚠ ' + d.lastError : '—');
+    $('lastReply').textContent = reply || '—';
 
     var hint;
     if (!s.root) hint = 'Usługa potrzebuje uprawnień roota, żeby przejąć przycisk mikrofonu pilota. Wybierz <b>Nadaj uprawnienia</b>, a potem uruchom aplikację ponownie.';
@@ -110,6 +113,7 @@
       luna(SVC + 'setSettings', { toasts: !cur }, function (r) { msg(r.returnValue ? '' : 'Błąd: ' + (r.errorText || '')); setTimeout(refresh, 3500); });
     },
     log: function () { state.showLog = !state.showLog; refresh(); },
+    detail: function () { openDetail(); },
     hands: function () {
       var cur = !(state.status && state.status.settings && state.status.settings.hands_free === false);
       msg(cur ? 'Wyłączam tryb bez pilota…' : 'Włączam tryb bez pilota…');
@@ -134,7 +138,30 @@
     Array.prototype.forEach.call(document.querySelectorAll('.btn'), function (b) { b.className = b.className.replace(/\s*focus/g, ''); });
     if (bs[focusIdx]) bs[focusIdx].className += ' focus';
   }
+  // ---------------- full-text panel (scrollable with up/down)
+  var detailOpen = false, detailY = 0;
+  function openDetail() {
+    detailOpen = true; detailY = 0;
+    $('detailText').textContent = state.full || '—';
+    $('detailText').style.transform = 'translateY(0)';
+    $('detail').className = '';
+  }
+  function closeDetail() { detailOpen = false; $('detail').className = 'hidden'; }
+  function scrollDetail(dir) {
+    var box = $('detail').querySelector('.body'), inner = $('detailText');
+    var max = Math.max(0, inner.offsetHeight - box.clientHeight);
+    detailY = Math.max(0, Math.min(max, detailY + dir * 120));
+    inner.style.transform = 'translateY(' + (-detailY) + 'px)';
+  }
+
   document.addEventListener('keydown', function (e) {
+    if (detailOpen) {
+      if (e.keyCode === 38) scrollDetail(-1);
+      else if (e.keyCode === 40) scrollDetail(1);
+      else if (e.keyCode === 13 || e.keyCode === 461 || e.keyCode === 27) closeDetail();
+      e.preventDefault();
+      return;
+    }
     var bs = visibleButtons();
     switch (e.keyCode) {
       case 37: case 38: focusIdx = Math.max(0, focusIdx - 1); fixFocus(); break;          // left / up

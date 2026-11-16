@@ -25,8 +25,18 @@
   .ok .dot { background:var(--ok); } .bad .dot { background:var(--bad); } .warn .dot { background:var(--warn); }
   .hint { font-size:25px; color:var(--dim); line-height:1.4; }
   .hint b { color:var(--txt); }
-  .last { font-size:28px; line-height:1.5; }
-  .last .who { color:var(--dim); display:inline-block; width:150px; }
+  .last { font-size:28px; line-height:1.45; }
+  .last > div { display:flex; }
+  .last .who { color:var(--dim); flex:0 0 150px; }
+  /* long replies (e.g. error dumps) must not push the layout: clamp, full text in the detail panel */
+  .last .txt { flex:1; min-width:0; overflow:hidden; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; word-break:break-word; }
+  #detail { position:fixed; left:96px; right:96px; top:80px; bottom:80px; background:#0a1018; border:3px solid var(--acc); border-radius:18px;
+            padding:34px 40px; font-size:28px; line-height:1.5; overflow:hidden; z-index:10; }
+  #detail .body { position:absolute; left:40px; right:40px; top:90px; bottom:80px; overflow:hidden; }
+  #detail .inner { white-space:pre-wrap; word-break:break-word; }
+  #detail h2 { margin:0 0 18px; font-size:34px; }
+  #detail .foot { position:absolute; left:40px; bottom:26px; font-size:22px; color:var(--dim); }
+  .hint, .nospy { max-height:150px; overflow:hidden; }
   .buttons { display:flex; flex-wrap:wrap; margin-bottom:16px !important; }
   .buttons .btn { margin:0 36px 20px 0; }
   .btn { font-size:30px; padding:18px 34px; border-radius:14px; background:var(--card); color:var(--txt); border:3px solid var(--line); }
@@ -53,7 +63,7 @@
     <div class="card"><div class="k">Adres satelity ESPHome</div><div class="v" id="addr">…</div>
       <div class="k" style="margin-top:14px">Mikrofon bez pilota (USB)</div><div class="v" id="usb" style="font-size:28px">…</div></div>
     <div class="card"><div class="k">Ostatnia rozmowa</div>
-      <div class="last"><div><span class="who">Ty:</span><span id="lastText">—</span></div><div><span class="who">Asystent:</span><span id="lastReply">—</span></div></div>
+      <div class="last"><div><span class="who">Ty:</span><span class="txt" id="lastText">—</span></div><div><span class="who">Asystent:</span><span class="txt" id="lastReply">—</span></div></div>
     </div>
   </div>
 
@@ -67,11 +77,14 @@
     <div class="btn" id="b-restart" data-act="restart">Uruchom ponownie</div>
     <div class="btn" id="b-hands" data-act="hands">Bez pilota: wł.</div>
     <div class="btn" id="b-toasts" data-act="toasts">Dymki: wł.</div>
+    <div class="btn" id="b-detail" data-act="detail">Pełna odpowiedź</div>
     <div class="btn" id="b-log" data-act="log">Pokaż log</div>
   </div>
   <div class="msg" id="msg"></div>
   <pre id="log" style="display:none"></pre>
 </div>
+<div id="detail" class="hidden"><h2>Ostatnia rozmowa</h2><div class="body"><div class="inner" id="detailText"></div></div>
+  <div class="foot">▲▼ przewijanie · OK / Wstecz zamyka</div></div>
 <script src="app.js"></script>
 </body>
 </html>

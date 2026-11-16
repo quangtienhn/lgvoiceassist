@@ -15,7 +15,7 @@ var net = require('net'), fs = require('fs'), path = require('path'), os = requi
 var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('./lib/mdns');
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.4.0';
+var VERSION = '0.4.1';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 var LOG = '/tmp/lgtv-assist.log';
 var STATUS = '/tmp/lgtv-assist.status.json';
@@ -201,7 +201,8 @@ function playUrls(urls, announcement, done) {
   player.queue = urls.filter(Boolean);
   player.announcing = !!announcement;
   player.done = done || null;
-  setPlayerState(announcement ? E.MP_STATE.ANNOUNCING : E.MP_STATE.PLAYING);
+  // HA's ESPHome media_player maps only idle/playing/paused (ANNOUNCING raised KeyError and stalled the entry)
+  setPlayerState(E.MP_STATE.PLAYING);
   playNext();
 }
 function playNext() {
