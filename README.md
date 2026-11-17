@@ -2,7 +2,7 @@
 
 Home Assistant voice satellite for rooted LG webOS TVs: push-to-talk with the **Magic Remote mic**.
 Home Assistant connects to the TV over the **ESPHome native API**, so there is no token or login on the TV;
-the connection can be **encrypted** with a pre-shared key, like any ESPHome device.
+the connection is **encrypted** with a key that Home Assistant sets by itself, as for an ESPHome device.
 The TV shows up in HA as an `assist_satellite` with a pipeline selector, area, announcements and timers.
 
 The app, its toasts on the TV and the entity names follow the TV menu language: **English, Polish, German, Spanish**
@@ -51,27 +51,32 @@ ssh root@TV 'luna-send -i luna://com.webos.appInstallService/dev/install \
 Open the app on the TV. On the first run (and after each reinstall) choose **Nadaj uprawnienia (Homebrew)**:
 the app calls `org.webosbrew.hbchannel.service/elevateService` and starts the service, which installs the boot hook
 `/var/lib/webosbrew/init.d/60-lgtv-assist`. Then in HA go to **Settings → Devices & services**, where the TV appears as a
-discovered ESPHome device ("LG TV"). To add it manually, use ESPHome with host = TV IP, port 6053 and no key
-(or the key shown in the app once encryption is on).
+discovered ESPHome device ("LG TV"). To add it manually, use ESPHome with host = TV IP and port 6053.
 
 ## Encryption
-Without encryption anyone on the home network can connect to port 6053, play media on the TV and, in hands-free
-mode, receive the microphone audio. Turn on **Encryption** in the app: the TV then accepts only
-`Noise_NNpsk0_25519_ChaChaPoly_SHA256` connections (the ESPHome API encryption) and shows the key, base64 of 32 bytes,
-made once on the TV. Home Assistant asks for it (a device that was already added shows *Reconfigure*); after turning
-encryption off again, Home Assistant asks to confirm that the key can go. The key lives in
-`/media/developer/lgtv-assist/settings.json` (`encryption`, `api_key`).
+The connection is encrypted with `Noise_NNpsk0_25519_ChaChaPoly_SHA256`, the ESPHome API encryption, and nobody has
+to type a key: as with an ESPHome device that has no key yet, **Home Assistant makes the key and hands it to the TV**
+the first time it connects (over a short Noise session with the all-zero key, so the key never crosses the network in
+the clear; Home Assistant older than that sends it over the plaintext session). From then on the TV accepts only
+connections that prove this key. Until Home Assistant has done so, the app shows *Encryption: waiting for Home
+Assistant* and the TV still answers in plaintext.
+
+- The key lives in `/media/developer/lgtv-assist/settings.json` (`api_key`, base64 of 32 bytes); the app never shows it.
+- **Encryption: off** in the app makes the TV plaintext-only and drops the key; Home Assistant then asks to confirm
+  that encryption was removed. Turning it on again lets Home Assistant set a new key.
+- To move the TV to another Home Assistant, turn encryption off and on once.
+- Without encryption anyone on the home network can connect to port 6053, play media on the TV and, in hands-free
+  mode, receive the microphone audio.
 
 The TV's Node 8 / OpenSSL 1.0.2 has neither X25519 nor ChaCha20-Poly1305, so both are implemented in plain JavaScript
-in `app/daemon/lib/noise.js` (X25519 after TweetNaCl, public domain). Not implemented: ESPHome's key provisioning by
-Home Assistant (`api_encryption_supported` is only announced while encryption is on).
+in `app/daemon/lib/noise.js` (X25519 after TweetNaCl, public domain).
 
 ## Tests
 ```sh
 node tools/check_i18n.js                 # translations complete and used
 node tools/test_noise.js                 # crypto test vectors (RFC 7748, RFC 8439), Noise handshake, framing; runs on Node 8
 python3 -m venv /tmp/venv && /tmp/venv/bin/pip install aioesphomeapi cryptography
-/tmp/venv/bin/python tools/test_interop.py      # the real daemon against the real Home Assistant client library
+/tmp/venv/bin/python tools/test_interop.py      # the real daemon against the real Home Assistant client library (encryption, key hand-over)
 /tmp/venv/bin/python tools/test_voice.py        # voice audio, events, announcements, languages; encrypted and plaintext
 /tmp/venv/bin/python tools/test_crypto_diff.py  # X25519 / ChaCha20-Poly1305 against OpenSSL on random inputs
 ```
@@ -103,6 +108,5 @@ Builds are reproducible: the commit time is used as the timestamp of every archi
 - Remote protocol (MR20, BLE, `hidraw` only while awake): voice report `0xFE`, 124 B = `FE seq 80 8B` + 2 × (`01 H2` + 57 B mSBC + pad).
 
 ## TODO
-- Encryption key provisioning by Home Assistant (no key to type), as newer ESPHome devices do.
 - Start TTS playback early from the streaming URL in `RUN_START`.
 - Listing in the Homebrew Channel repository (webosbrew/apps-repo) for one-click install and auto re-elevation.

@@ -10,6 +10,7 @@ The TV side is faked through tools/daemon_harness.py: a USB microphone (pactl li
 language, exactly as a webOS 5 TV does) and toasts (luna-send calls are recorded).
 """
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -112,7 +113,11 @@ def continuous(pcm):
 async def session_suite(encryption):
     label = "encrypted" if encryption else "plaintext"
     print("\n== voice session, %s; TV menu language Polish ==" % label)
-    settings = {"name": NAME, "friendly_name": "LG Test", "encryption": encryption}
+    settings = {"name": NAME, "friendly_name": "LG Test"}
+    if encryption:
+        settings["api_key"] = base64.b64encode(os.urandom(32)).decode()      # as provisioned by Home Assistant
+    else:
+        settings["encryption"] = False
     with DaemonHarness(settings=settings, fakes={"luna-send": luna_send("pl-PL"), "pactl": PACTL, "parec": PAREC}) as d:
         client = APIClient("127.0.0.1", d.port, None, noise_psk=d.key if encryption else None, expected_name=NAME)
         await asyncio.wait_for(client.connect(login=True), 15)

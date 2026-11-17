@@ -17,7 +17,7 @@ var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('
 var I18N = require('../i18n');   // translations shared with the app UI (app folder)
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.6.0';
+var VERSION = '0.6.1';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 // LGTV_ASSIST_TMP: prefix of the log/status/pid files (default keeps the paths the TV service reads); for tests
 var TMP = process.env.LGTV_ASSIST_TMP || '/tmp/lgtv-assist';
@@ -264,32 +264,82 @@ function setPlayerState(st) { player.state = st; broadcast('MediaPlayerStateResp
 function playerStateMsg() { return { key: MP_KEY, state: player.state, volume: player.volume, muted: player.muted }; }
 
 // ------------------------------------------------------------------ API encryption (Noise)
-// CFG.encryption === true: only Noise_NNpsk0_25519_ChaChaPoly_SHA256 connections are accepted, with the
-// pre-shared key CFG.api_key (base64 of 32 bytes, as ESPHome's `api: encryption: key:`). With encryption on
-// and no usable key we make a new one and store it in settings.json: never fall back to plaintext.
-var ENCRYPTED = CFG.encryption === true;
-var API_KEY = null;
-if (ENCRYPTED) {
-  API_KEY = noise.parseKey(CFG.api_key);
-  if (!API_KEY) {
-    var newKey = noise.generateKey();
-    log('api: encryption is on but api_key is ' + (CFG.api_key ? 'invalid' : 'missing') + '; generated a new key');
-    try {
-      var sf = path.join(DATA_DIR, 'settings.json'), cur = readJson(sf, {}), tmpf = sf + '.tmp';
-      cur.api_key = newKey;
-      fs.writeFileSync(tmpf, JSON.stringify(cur, null, 2) + '\n', { mode: 0o600 });
-      fs.renameSync(tmpf, sf);
-      log('api: new api_key saved to settings.json');
-    } catch (e) {
-      log('api: could not save the new api_key (' + e.message + '); it is only valid until the daemon restarts');
-      status.lastError = 'api_key not saved: ' + e.message;
-    }
-    CFG.api_key = newKey;
-    API_KEY = noise.parseKey(newKey);
+// As with an ESPHome device, Home Assistant sets the key itself, so nobody has to type it:
+//  * encryption wanted (CFG.encryption !== false, the default) but no key yet = "unprovisioned": plaintext
+//    still works, we announce api_encryption_supported + api_encryption_provisionable, and a client may open
+//    a Noise session with the all-zero key to hand over the real one (NoiseEncryptionSetKeyRequest) without
+//    it crossing the network in the clear. Home Assistant does this on its own when it connects.
+//  * key present (CFG.api_key, base64 of 32 bytes): only Noise_NNpsk0_25519_ChaChaPoly_SHA256 connections
+//    that prove this key are accepted.
+//  * CFG.encryption === false: plaintext only; encryption is not announced, so no key is set.
+var ENC_WANTED = CFG.encryption !== false;
+var API_KEY = ENC_WANTED ? noise.parseKey(CFG.api_key) : null;
+if (ENC_WANTED && CFG.api_key && !API_KEY) log('api: api_key in settings.json is not a usable key; waiting for a new one');
+var ZERO_PSK = Buffer.alloc(32);
+var HELLO_TIMEOUT_MS = 20000;   // an encrypted client must finish the handshake within this time
+function encrypted() { return !!API_KEY; }
+function provisionable() { return ENC_WANTED && !API_KEY; }
+function encStatus() { status.encryption = encrypted(); status.provisionable = provisionable(); saveStatus(); }
+encStatus();
+// mDNS TXT records as an ESPHome device sets them
+function encTxt(txt) {
+  delete txt.api_encryption; delete txt.api_encryption_supported; delete txt.api_provisioning;
+  if (encrypted()) txt.api_encryption = noise.NOISE_NAME;
+  else if (provisionable()) { txt.api_encryption_supported = noise.NOISE_NAME; txt.api_provisioning = 'zero-psk'; }
+}
+
+// Stores the key (base64 text) in settings.json, or removes it (null); the other settings stay.
+function saveKey(key) {
+  try {
+    var sf = path.join(DATA_DIR, 'settings.json'), cur = readJson(sf, {}), tmpf = sf + '.tmp';
+    if (key) cur.api_key = key; else delete cur.api_key;
+    fs.writeFileSync(tmpf, JSON.stringify(cur, null, 1) + '\n', { mode: 0o600 });
+    fs.renameSync(tmpf, sf);
+    return true;
+  } catch (e) {
+    log('api: could not save settings.json (' + e.message + ')');
+    return false;
   }
 }
-status.encryption = ENCRYPTED; saveStatus();
-var HELLO_TIMEOUT_MS = 20000;   // an encrypted client must finish the handshake within this time
+
+// NoiseEncryptionSetKeyRequest: key = base64 text of 32 bytes; empty = remove the key (back to unprovisioned).
+// Accepted while unprovisioned (any session, like ESPHome) or on a session that proved the current key.
+function onSetKey(client, m) {
+  var text = m.key && m.key.length ? m.key.toString('latin1') : '', key = text ? noise.parseKey(text) : null, ok = false;
+  if (!ENC_WANTED) log('api: key refused: encryption is turned off in the app');
+  else if (!provisionable() && !(client.noise && !client.zeroKey)) log('api: key refused: this session did not prove the current key');
+  else if (text && !key) log('api: key refused: not base64 of 32 bytes (or all zeros)');
+  else ok = saveKey(text || null);
+  client.send('NoiseEncryptionSetKeyResponse', { success: ok });
+  if (!ok) return;
+  log('api: encryption key ' + (key ? 'set' : 'removed') + ' by', client.name, '@', client.sock.remoteAddress,
+    client.noise ? '(over Noise)' : '(over plaintext)');
+  // like ESPHome: the answer goes out first, then every session from before the change is closed
+  setTimeout(function () {
+    API_KEY = key; CFG.api_key = key ? text : undefined;
+    encStatus(); encTxt(TXT); mdns.announce();
+    log('api: encryption is now', encrypted() ? 'on' : 'waiting for a key', '- closing', clients.length, 'connection(s)');
+    clients.slice().forEach(function (c) {
+      try { c.send('DisconnectRequest', {}); } catch (e) {}
+      c.sock.end();
+      setTimeout(function () { c.sock.destroy(); }, 1000);
+    });
+  }, 100);
+}
+
+function attachNoise(c, psk) {
+  var sock = c.sock;
+  c.noise = new noise.Transport({ psk: psk, name: CFG.name, mac: MAC.replace(/:/g, '').toLowerCase(),
+    write: function (b) { if (!sock.destroyed) sock.write(b); },
+    onPacket: function (type, data) { c.dispatch(type, data); },
+    onReady: function () { clearTimeout(c.hsTimer); },
+    onClose: function (why) {
+      clearTimeout(c.hsTimer);
+      log('api: closing', sock.remoteAddress + ':', why);
+      sock.end(); setTimeout(function () { sock.destroy(); }, 2000);
+    } });
+  c.hsTimer = setTimeout(function () { if (!c.noise.isReady()) c.noise.close('handshake timeout'); }, HELLO_TIMEOUT_MS);
+}
 
 // ------------------------------------------------------------------ ESPHome API server
 var clients = [];          // connected API clients
@@ -297,7 +347,9 @@ var va = null;             // client subscribed to voice assistant
 
 function Client(sock) {
   this.sock = sock; this.buf = Buffer.alloc(0); this.name = '?'; this.subscribedStates = false;
-  this.noise = null;      // Noise transport (encryption on); null = plaintext framing
+  this.noise = null;      // Noise transport; null = plaintext framing
+  this.zeroKey = false;   // Noise session with the all-zero key (provisioning only)
+  this.frames = 0; this.hsTimer = null;
   clients.push(this);
 }
 Client.prototype.send = function (type, obj) {
@@ -312,6 +364,13 @@ Client.prototype.onData = function (d) {
   if (this.rejected) return;
   this.buf = Buffer.concat([this.buf, d]);
   while (this.buf.length >= 3) {
+    if (this.buf[0] === 1 && !this.frames && provisionable()) {
+      // No key yet: a client may open a Noise session with the all-zero key to hand over the real one
+      log('api: zero-key Noise session from', this.sock.remoteAddress);
+      var all = this.buf; this.buf = Buffer.alloc(0);
+      this.zeroKey = true; attachNoise(this, ZERO_PSK);
+      return this.noise.receive(all);
+    }
     if (this.buf[0] !== 0) {
       // like a plaintext ESPHome device: "\0Bad indicator byte" tells a Noise client that we speak plaintext
       log('api: encrypted client but encryption is off; told it we use plaintext');
@@ -325,6 +384,7 @@ Client.prototype.onData = function (d) {
     if (this.buf.length < start + len) return;
     var payload = this.buf.slice(start, start + len);
     this.buf = this.buf.slice(start + len);
+    this.frames++;
     this.dispatch(type, payload);
   }
 };
@@ -348,7 +408,8 @@ Client.prototype.handle = function (name, m) {
       return this.send('DeviceInfoResponse', {
         name: CFG.name, friendly_name: CFG.friendly_name, mac_address: MAC, esphome_version: '2025.9.0',
         model: 'LG webOS TV (Magic Remote mic)', manufacturer: 'LG Electronics', project_name: 'lgtv-assist.LG TV Assist',
-        project_version: VERSION, suggested_area: CFG.suggested_area, api_encryption_supported: ENCRYPTED,
+        project_version: VERSION, suggested_area: CFG.suggested_area,
+        api_encryption_supported: ENC_WANTED, api_encryption_provisionable: provisionable(),
         voice_assistant_feature_flags: E.VA_FEATURE.VOICE_ASSISTANT | E.VA_FEATURE.API_AUDIO | E.VA_FEATURE.ANNOUNCE |
           E.VA_FEATURE.START_CONVERSATION | E.VA_FEATURE.TIMERS });
     case 'ListEntitiesRequest':
@@ -385,6 +446,7 @@ Client.prototype.handle = function (name, m) {
       return;
     case 'VoiceAssistantConfigurationRequest':
       return this.send('VoiceAssistantConfigurationResponse', { available_wake_words: [], active_wake_words: [], max_active_wake_words: 0 });
+    case 'NoiseEncryptionSetKeyRequest': return onSetKey(this, m);
     case 'VoiceAssistantResponse': return onVaResponse(this, m);
     case 'VoiceAssistantEventResponse': return onVaEvent(this, m);
     case 'VoiceAssistantAnnounceRequest': return onAnnounce(this, m);
@@ -406,26 +468,15 @@ function setHa(c) {
 function broadcast(type, obj) { clients.forEach(function (c) { if (c.subscribedStates) c.send(type, obj); }); }
 
 var server = net.createServer(function (sock) {
-  var c = new Client(sock), hsTimer = null;
+  var c = new Client(sock);
   sock.setNoDelay(true);
   log('api: connection from', sock.remoteAddress);
-  if (ENCRYPTED) {
-    c.noise = new noise.Transport({ psk: API_KEY, name: CFG.name, mac: MAC.replace(/:/g, '').toLowerCase(),
-      write: function (b) { if (!sock.destroyed) sock.write(b); },
-      onPacket: function (type, data) { c.dispatch(type, data); },
-      onReady: function () { clearTimeout(hsTimer); },
-      onClose: function (why) {
-        clearTimeout(hsTimer);
-        log('api: closing', sock.remoteAddress + ':', why);
-        sock.end(); setTimeout(function () { sock.destroy(); }, 2000);
-      } });
-    hsTimer = setTimeout(function () { if (!c.noise.isReady()) c.noise.close('handshake timeout'); }, HELLO_TIMEOUT_MS);
-  }
+  if (encrypted()) attachNoise(c, API_KEY);
   sock.on('data', function (d) {
     try { c.onData(d); } catch (e) { log('api: error from', sock.remoteAddress + ':', e.stack || e); sock.destroy(); }
   });
   sock.on('error', function () {});
-  sock.on('close', function () { clearTimeout(hsTimer); log('api: closed', sock.remoteAddress); c.closed(); });
+  sock.on('close', function () { clearTimeout(c.hsTimer); log('api: closed', sock.remoteAddress); c.closed(); });
 });
 server.on('error', function (e) { log('api server error', e.message); process.exit(1); });
 // The entity name is translated, so learn the TV language before Home Assistant can list entities:
@@ -796,7 +847,7 @@ watchScreen();
 var TXT = { friendly_name: CFG.friendly_name, version: '2025.9.0', mac: MAC.replace(/:/g, '').toLowerCase(),
   platform: 'HOST', board: 'lg-webos', network: NET.ifname.indexOf('wlan') === 0 ? 'wifi' : 'ethernet',
   project_name: 'lgtv-assist.LG TV Assist', project_version: VERSION };
-if (ENCRYPTED) TXT.api_encryption = noise.NOISE_NAME;   // tells Home Assistant to ask for the key
+encTxt(TXT);
 var mdns = new Mdns({ instance: CFG.name, host: CFG.name, ip: NET.ip, port: CFG.port, txt: TXT });
 mdns.start(log);
 
