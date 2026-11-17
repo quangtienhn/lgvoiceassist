@@ -32,6 +32,21 @@ jobs:
           for f in app/daemon/*.sh; do sh -n "$f"; done
           python3 -c "import json,sys; [json.load(open(f)) for f in sys.argv[1:]]" app/appinfo.json app/services/*/*.json
 
+      # Third-party sources and the webOS toolchain (~350 MB), at the versions pinned in native/build.sh
+      - uses: actions/cache@v6
+        with:
+          path: native/.deps
+          key: native-deps-${{ hashFiles('native/build.sh') }}
+
+      - name: Build the wake word detector for the TV
+        run: native/build.sh webos
+
+      - name: Wake word detector against the reference implementation (this machine's build)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mwwvenv"
+          "$RUNNER_TEMP/mwwvenv/bin/pip" install -q pymicro-wakeword==2.5.0 ai-edge-litert
+          "$RUNNER_TEMP/mwwvenv/bin/python" tools/test_wakeword.py
+
       - name: Build IPK and manifest
         env:
           RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -108,13 +123,19 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: '8.12.0'
+      - uses: actions/cache@v6
+        with:
+          path: native/.deps
+          key: native-deps-${{ hashFiles('native/build.sh') }}
+      - name: Build the wake word detector for this machine (used by the voice test)
+        run: native/build.sh host
       - name: Install the Home Assistant ESPHome client
         run: python3 -m venv "$RUNNER_TEMP/venv" && "$RUNNER_TEMP/venv/bin/pip" install -q aioesphomeapi cryptography
       - name: Interoperability (encryption, key errors, plaintext)
         run: |
           "$RUNNER_TEMP/venv/bin/python" -c "import aioesphomeapi; print('aioesphomeapi', aioesphomeapi.__version__ if hasattr(aioesphomeapi, '__version__') else '')"
           "$RUNNER_TEMP/venv/bin/python" tools/test_interop.py
-      - name: Voice audio, events and languages
+      - name: Voice audio, events, languages, wake word on the TV
         run: '"$RUNNER_TEMP/venv/bin/python" tools/test_voice.py'
       - name: Crypto against OpenSSL
         run: '"$RUNNER_TEMP/venv/bin/python" tools/test_crypto_diff.py'

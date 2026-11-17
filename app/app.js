@@ -65,13 +65,17 @@
     setCard('c-ha', connected ? 'ok' : 'warn');
     $('addr').textContent = (d.ip || '?') + ':' + (d.port || 6053) + '  (' + (d.name || 'lg-tv-assist') + ')';
     var handsOn = set.hands_free !== false;
+    // wake word: detected on the TV (d.wake.on === 'tv', with the model's phrase) or by Home Assistant
+    var onTv = !!(d.wake && d.wake.on === 'tv'), wakeWord = onTv ? d.wake.word : 'Okay Nabu', models = d.wakeModels || [];
     var micName = d.usbMic ? d.usbMic.replace(/^alsa_input\.usb-/, '').replace(/\.analog-.*$/, '').replace(/-\d+$/, '').replace(/_/g, ' ') : null;
     $('usb').textContent = !micName ? t('usb_none')
       : !handsOn ? t('usb_off', { mic: micName })
-      : d.listening ? t('usb_listening', { mic: micName }) : micName;
+      : d.listening ? t('usb_listening', { mic: micName, word: wakeWord }) : micName;
     $('b-hands').textContent = t('btn_hands', { v: onOff(handsOn) });
     $('b-wscreen').textContent = t('btn_wscreen', { v: onOff(set.wake_screen !== false) });
     $('b-wscreen').className = 'btn' + (d.usbMic && handsOn ? '' : ' hidden');
+    $('b-wake').textContent = t('btn_wake', { v: onTv ? t('wake_tv', { word: d.wake.word }) : t('wake_ha') });
+    $('b-wake').className = 'btn' + (d.usbMic && handsOn && models.length ? '' : ' hidden');
     // encryption: on unless turned off; Home Assistant sets the key by itself, until then we wait for it
     var encWanted = set.encryption !== false, hasKey = s.running ? d.encryption === true : set.has_key === true;
     $('b-enc').textContent = t('btn_enc', { v: !encWanted ? t('off') : hasKey ? t('on') : t('enc_waiting') });
@@ -86,7 +90,7 @@
     var hint;
     if (!s.root) hint = t('hint_root');
     else if (!connected) hint = t('hint_connect', { name: esc(set.friendly_name || 'LG TV'), ip: esc(d.ip || '?'), port: esc(d.port || 6053) });
-    else if (d.usbMic && handsOn) hint = t('hint_handsfree');
+    else if (d.usbMic && handsOn) hint = onTv ? t('hint_handsfree_tv', { word: esc(d.wake.word) }) : t('hint_handsfree');
     else hint = t('hint_ptt');
     $('hint').innerHTML = hint;
 
@@ -180,6 +184,12 @@
         msg(r.returnValue ? t(cur ? 'msg_enc_off' : 'msg_enc_on') : t('msg_error', { err: r.errorText || '' }));
         if (r.returnValue && r.settings) { s.settings = r.settings; render(s); }
       });
+    },
+    wake: function () {
+      // cycle: each wake word the TV can detect itself -> detection by Home Assistant -> ...
+      var d = (state.status || NO_ROOT).daemon || {}, ids = (d.wakeModels || []).map(function (m) { return m.id; }).concat(['ha']);
+      var cur = d.wake && d.wake.on === 'tv' ? d.wake.id : 'ha';
+      luna(SVC + 'setSettings', { wake_word: ids[(ids.indexOf(cur) + 1) % ids.length] }, function (r) { fail(r); setTimeout(refresh, 1500); });
     },
     log: function () { openLog(); },
     detail: function () { openDetail(); },

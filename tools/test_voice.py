@@ -13,11 +13,13 @@ import asyncio
 import base64
 import json
 import os
+import re
+import shlex
 import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from daemon_harness import DaemonHarness  # noqa: E402
+from daemon_harness import DaemonHarness, ROOT  # noqa: E402
 
 from aioesphomeapi import APIClient, VoiceAssistantEventType as Ev, VoiceAssistantTimerEventType as Tm  # noqa: E402
 
@@ -113,7 +115,7 @@ def continuous(pcm):
 async def session_suite(encryption):
     label = "encrypted" if encryption else "plaintext"
     print("\n== voice session, %s; TV menu language Polish ==" % label)
-    settings = {"name": NAME, "friendly_name": "LG Test"}
+    settings = {"name": NAME, "friendly_name": "LG Test", "wake_word": "ha"}   # Home Assistant detects the wake word
     if encryption:
         settings["api_key"] = base64.b64encode(os.urandom(32)).decode()      # as provisioned by Home Assistant
     else:
@@ -174,6 +176,80 @@ async def session_suite(encryption):
               [l for l in d.log().splitlines() if "uncaught" in l or "handler" in l][:3])
 
 
+def parec_playing(wav_paths, gap_s=2.0):
+    """A fake parec that plays the given recordings (16 kHz mono) with silence around them, in real time,
+    then stays silent."""
+    files = " ".join(shlex.quote(p) for p in wav_paths)
+    return ("#!/bin/sh\n"
+            "exec python3 -u -c '\n"
+            "import sys, time, wave\n"
+            "def pcm(p):\n"
+            "    w = wave.open(p, \"rb\"); return w.readframes(w.getnframes())\n"
+            "gap = bytes(int(%f * 32000) & ~1)\n"
+            "data = gap + b\"\".join(pcm(p) + gap for p in sys.argv[1:])\n"
+            "t = time.time(); i = 0\n"
+            "while True:\n"
+            "    chunk = data[i:i + 640] if i < len(data) else bytes(640)\n"
+            "    i += 640\n"
+            "    sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()\n"
+            "    t += 0.02; time.sleep(max(0, t - time.time()))\n"
+            "' %s\n") % (gap_s, files)
+
+
+async def local_wake_suite():
+    print("\n== wake word detected on the TV (microWakeWord) ==")
+    mww = os.environ.get("LGTV_ASSIST_MWW") or os.path.join(ROOT, "native", "build", "host", "mww")
+    models = os.path.join(ROOT, "app", "daemon", "models")
+    recordings = os.path.join(os.environ.get("MWW_DEPS") or os.path.join(ROOT, "native", ".deps"), "pymicro-wakeword", "tests")
+    if not (os.path.exists(mww) and os.path.exists(os.path.join(models, "okay_nabu.tflite")) and os.path.isdir(recordings)):
+        check("detector, models and recordings present (run native/build.sh host and webos)", False, (mww, models, recordings))
+        return
+    nabu = os.path.join(recordings, "okay_nabu", "1.wav")
+    jarvis = os.path.join(recordings, "hey_jarvis", "1.wav")
+    fakes = {"luna-send": luna_send("pl-PL"), "pactl": PACTL, "parec": parec_playing([jarvis, nabu])}
+    with DaemonHarness(settings={"name": NAME, "api_key": base64.b64encode(os.urandom(32)).decode()}, fakes=fakes) as d:
+        client = APIClient("127.0.0.1", d.port, None, noise_psk=d.key, expected_name=NAME)
+        await asyncio.wait_for(client.connect(login=True), 15)
+        check("status: wake word on the TV, Okay Nabu", (d.status().get("wake") or {}).get("on") == "tv" and d.status()["wake"].get("word") == "Okay Nabu", d.status().get("wake"))
+        check("status lists the four models", sorted(m["id"] for m in d.status().get("wakeModels", [])) == ["alexa", "hey_jarvis", "hey_mycroft", "okay_nabu"], d.status().get("wakeModels"))
+        voice = Voice(client)
+        # 2 s silence, "hey jarvis" (must not wake), 2 s, "okay nabu" (must), ...
+        check("nothing is sent to Home Assistant before the wake word", not await wait_for(lambda: voice.starts, 4.5) and not voice.audio, voice.starts)
+        check("'Okay Nabu' starts a run on the TV's initiative", await wait_for(lambda: voice.starts, 8), d.log()[-500:])
+        check("the run starts at speech-to-text (flags = VAD only)", voice.starts[:1] == [1], voice.starts)
+        hits = re.findall(r"wake word: Okay Nabu \d", d.log())
+        check("'Hey Jarvis' before it did not wake the TV (one detection, for 'Okay Nabu')", len(hits) == 1, d.log()[-600:])
+        await wait_for(lambda: len(voice.audio) >= 32000, 5)
+        check("audio after the wake word reaches Home Assistant (%d bytes)" % len(voice.audio), len(voice.audio) >= 32000)
+        check("wake word -> Polish 'listening' toast", await wait_for(lambda: "Słucham…" in luna_log(d)), luna_log(d)[-300:])
+        client.send_voice_assistant_event(Ev.VOICE_ASSISTANT_RUN_END, None)
+        runs = len(voice.starts)
+        await asyncio.sleep(3)
+        check("after the run nothing more is sent until the next wake word", len(voice.starts) == runs, voice.starts)
+        # switching the wake word to Home Assistant: the continuous stream comes back
+        s = d.read_settings(); s["wake_word"] = "ha"
+        with open(d.settings_path, "w") as f:
+            json.dump(s, f)
+        check("wake_word 'ha' -> Home Assistant gets a wake word run again", await wait_for(lambda: len(voice.starts) > runs and voice.starts[-1] == 3, 10), voice.starts)
+        check("status: wake word by Home Assistant", (d.status().get("wake") or {}).get("on") == "ha", d.status().get("wake"))
+        await client.disconnect()
+        check("daemon alive, nothing uncaught", d.proc.poll() is None and "uncaught" not in d.log(), d.log()[-300:])
+
+    # a detector that cannot run must not leave the TV deaf
+    broken = {"luna-send": luna_send("pl-PL"), "pactl": PACTL, "parec": PAREC}
+    os.environ["LGTV_ASSIST_MWW"] = "/bin/false"
+    try:
+        with DaemonHarness(settings={"name": NAME, "encryption": False}, fakes=broken) as d:
+            client = APIClient("127.0.0.1", d.port, None, expected_name=NAME)
+            await asyncio.wait_for(client.connect(login=True), 15)
+            voice = Voice(client)
+            ok = await wait_for(lambda: voice.starts and voice.starts[-1] == 3, 25)
+            check("a detector that keeps failing -> falls back to Home Assistant's wake word", ok and "giving up on the detector" in d.log(), d.log()[-500:])
+            await client.disconnect()
+    finally:
+        del os.environ["LGTV_ASSIST_MWW"]
+
+
 async def language_suite():
     print("\n== language fallbacks ==")
     for title, settings, ui, want in [
@@ -195,6 +271,7 @@ async def language_suite():
 async def main():
     await session_suite(True)
     await session_suite(False)
+    await local_wake_suite()
     await language_suite()
     print("\n%d passed, %d failed" % (sum(results), len(results) - sum(results)))
     return 0 if all(results) else 1

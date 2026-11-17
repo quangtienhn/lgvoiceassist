@@ -145,7 +145,7 @@ service.register('setSettings', function (message) {
   if (needRoot(message)) return;
   var p = message.payload || {}, file = path.join(DATA, 'settings.json');
   var s = readJson(file, {}), prev = readJson(file, {});
-  ['friendly_name', 'name', 'toasts', 'suggested_area', 'max_seconds', 'hands_free', 'mic_gain', 'duck', 'duck_volume', 'wake_screen', 'lang', 'tv_locale', 'encryption'].forEach(function (k) {
+  ['friendly_name', 'name', 'toasts', 'suggested_area', 'max_seconds', 'hands_free', 'mic_gain', 'duck', 'duck_volume', 'wake_screen', 'lang', 'tv_locale', 'encryption', 'wake_word'].forEach(function (k) {
     if (p[k] !== undefined) s[k] = p[k];
   });
   if (s.name) s.name = String(s.name).toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 31);
@@ -154,6 +154,8 @@ service.register('setSettings', function (message) {
   // which the app reports as tv_locale (e.g. "pl-PL")
   if (s.lang !== undefined && !/^[a-z]{2}$/.test(String(s.lang))) delete s.lang;
   if (s.tv_locale !== undefined && !/^[A-Za-z_-]{2,16}$/.test(String(s.tv_locale))) delete s.tv_locale;
+  // wake_word: the id of a model the TV listens for itself (models/<id>.json), or "ha" = Home Assistant detects it
+  if (s.wake_word !== undefined && !/^[a-z0-9_]{1,40}$/.test(String(s.wake_word))) delete s.wake_word;
   // encryption (on unless false): Home Assistant hands the daemon a key by itself (api_key, never set from here).
   // Turning it off or on again drops the key, so the next key is again set by Home Assistant, not typed.
   var wasWanted = prev.encryption !== false;

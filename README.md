@@ -30,9 +30,11 @@ app/                                  packaged into the .ipk
   daemon/satellite.js                 ESPHome satellite daemon (Node 8, no npm deps)
   daemon/lib/{pb,messages,mdns}.js    protobuf codec, API message subset, mDNS responder
   daemon/lib/noise.js                 API encryption: X25519, ChaCha20-Poly1305, Noise handshake, framing
+  daemon/bin/mww, daemon/models/      wake word detector and models (built by native/build.sh, not in git)
   daemon/{autostart,loop,stop,init-hook}.sh
   services/io.github.xrogers.lgtvassist.service/
     service.js                        luna service: status/start/stop/restart/setSettings (runs as root)
+native/mww.cc, native/build.sh        the wake word detector and its build
 tools/build_ipk.py                    builds dist/*.ipk + the Homebrew Channel manifest (no ares-cli needed)
 tools/check_i18n.js                   checks that all translations are complete and used
 tools/test_*.{js,py}, daemon_harness* tests (see below)
@@ -43,6 +45,7 @@ legacy/                               first prototype (TV → HA WebSocket with 
 
 ## Build and install (local)
 ```sh
+native/build.sh webos                           # wake word detector + models (optional; without it HA detects the wake word)
 python3 tools/build_ipk.py                      # → dist/io.github.xrogers.lgtvassist_<ver>_all.ipk (+ manifest)
 scp dist/*.ipk root@TV:/tmp/lgtvassist.ipk
 ssh root@TV 'luna-send -i luna://com.webos.appInstallService/dev/install \
@@ -52,6 +55,28 @@ Open the app on the TV. On the first run (and after each reinstall) choose **Nad
 the app calls `org.webosbrew.hbchannel.service/elevateService` and starts the service, which installs the boot hook
 `/var/lib/webosbrew/init.d/60-lgtv-assist`. Then in HA go to **Settings → Devices & services**, where the TV appears as a
 discovered ESPHome device ("LG TV"). To add it manually, use ESPHome with host = TV IP and port 6053.
+
+## Wake word on the TV
+With a USB microphone the TV listens for the wake word **itself** (microWakeWord, the engine of ESPHome voice
+devices such as Home Assistant Voice PE): nothing leaves the TV until it hears the word, then the audio goes to Home
+Assistant, starting at speech-to-text. The app's **Wake word** button picks *Okay Nabu* (default), *Hey Jarvis*,
+*Hey Mycroft* or *Alexa*, or *by Home Assistant*: the microphone is then streamed to Home Assistant all the time
+and its wake word engine (e.g. openWakeWord) listens, as before 0.7.
+
+- `app/daemon/bin/mww` is a small native program (`native/mww.cc`): TensorFlow Lite Micro plus TensorFlow's audio
+  "microfrontend", reading 16 kHz audio on stdin and printing `wake <model> <probability>`. On the TV it uses
+  about 2 % of one core per model and 1 MB of memory.
+- `native/build.sh webos` builds it with the webOS toolchain (openlgtv/buildroot-nc4) as a 32-bit ARM binary and
+  copies the models (from pymicro-wakeword) to `app/daemon/models/`; `native/build.sh host` builds it for tests.
+  All third-party code is fetched at pinned versions; licences: `app/daemon/bin/THIRD_PARTY_LICENSES.txt`.
+- It gives the same results as pymicro-wakeword, the reference implementation (`tools/test_wakeword.py`): the model
+  input is bit-identical, and every model output is bit-identical to TensorFlow Lite's reference kernels.
+  pymicro-wakeword runs TensorFlow Lite's optimised kernels, which round a little differently (194 of 5965 outputs
+  differ on its test recordings, by at most 21/255); every recording is detected or rejected the same way.
+- The frontend's lookup tables are computed with the C library's float functions, and the TV's older libm rounds
+  a few entries differently. The TV build therefore carries the tables computed on the build machine
+  (`mww --dump-tables`), so the TV's output is bit-identical to the build machine's.
+- If the detector cannot run (or keeps stopping), the TV falls back to Home Assistant's wake word by itself.
 
 ## Encryption
 The connection is encrypted with `Noise_NNpsk0_25519_ChaChaPoly_SHA256`, the ESPHome API encryption, and nobody has
@@ -79,6 +104,8 @@ python3 -m venv /tmp/venv && /tmp/venv/bin/pip install aioesphomeapi cryptograph
 /tmp/venv/bin/python tools/test_interop.py      # the real daemon against the real Home Assistant client library (encryption, key hand-over)
 /tmp/venv/bin/python tools/test_voice.py        # voice audio, events, announcements, languages; encrypted and plaintext
 /tmp/venv/bin/python tools/test_crypto_diff.py  # X25519 / ChaCha20-Poly1305 against OpenSSL on random inputs
+native/build.sh host && /tmp/venv/bin/pip install pymicro-wakeword==2.5.0 ai-edge-litert
+/tmp/venv/bin/python tools/test_wakeword.py     # wake word detector against the reference implementation
 ```
 `tools/daemon_harness.py` runs the unmodified daemon off-TV (stub `palmbus`, fake `luna-send`/`pactl`/`parec`, temp
 directories). `LGTV_NODE=/path/to/node` picks the Node binary, e.g. Node 8.12 as on the TV.

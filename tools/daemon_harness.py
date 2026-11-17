@@ -102,6 +102,9 @@ class DaemonHarness:
             "LGTV_ASSIST_TMP": os.path.join(self.dir, "tmp", "lgtv-assist"),
             "LGTV_HARNESS_MDNS": os.path.join(self.dir, "tmp", "mdns.b64"),
             "LGTV_HARNESS_DIR": self.dir,
+            # the wake word detector built for this machine (native/build.sh host); app/daemon/bin/mww is for the TV
+            "LGTV_ASSIST_MWW": os.environ.get("LGTV_ASSIST_MWW") or os.path.join(ROOT, "native", "build", "host", "mww"),
+            "LGTV_ASSIST_MODELS": os.environ.get("LGTV_ASSIST_MODELS") or os.path.join(ROOT, "app", "daemon", "models"),
         })
         self.proc = subprocess.Popen(
             [self.node, "-r", os.path.join(HERE, "daemon_harness", "preload.js"), SATELLITE],

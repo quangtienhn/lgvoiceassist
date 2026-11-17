@@ -8,6 +8,8 @@
 //    PCM s16le 16 kHz mono on a unix socket; we forward it as VoiceAssistantAudio.
 //  * Replies, announcements and media_player URLs are played with mpg123 (MP3) or gst-play-1.0.
 //  * Toasts and the entity name follow the TV menu language (English, Polish, German, Spanish).
+//  * Hands-free with a USB microphone: the wake word is detected on the TV (bin/mww, microWakeWord) or,
+//    without that detector, by Home Assistant from a continuous stream.
 //
 // Node 8 (TV firmware), no npm dependencies. Runs as root (needs luna name + LG service control).
 'use strict';
@@ -17,7 +19,7 @@ var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('
 var I18N = require('../i18n');   // translations shared with the app UI (app folder)
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.6.1';
+var VERSION = '0.7.0';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 // LGTV_ASSIST_TMP: prefix of the log/status/pid files (default keeps the paths the TV service reads); for tests
 var TMP = process.env.LGTV_ASSIST_TMP || '/tmp/lgtv-assist';
@@ -535,13 +537,145 @@ function configureUsbMic(src) {
 
 function UsbMic(src, onData) {
   this.closed = false;
+  var self0 = this;
+  if (ear && ear.src === src) {          // the ear already records this microphone: share its stream
+    this.proc = null;
+    this.listener = function (pcm) { if (!self0.closed) onData(pcm); };
+    ear.listeners.push(this.listener);
+    return;
+  }
   var p = this.proc = spawnClean('parec', PA.concat(['-d', src, '--rate=16000', '--channels=1', '--format=s16le', '--latency-msec=40']));
   var self = this;
   p.stdout.on('data', function (pcm) { if (!self.closed) onData(pcm); });
   p.on('error', function () {});
   p.on('exit', function () { if (!self.closed) { log('usb mic: parec exited'); usb.source = null; } });
 }
-UsbMic.prototype.close = function () { this.closed = true; try { this.proc.kill(); } catch (e) {} };
+UsbMic.prototype.close = function () {
+  this.closed = true;
+  if (this.proc) { try { this.proc.kill(); } catch (e) {} }
+  else if (ear) ear.listeners = ear.listeners.filter(function (l) { return l !== this.listener; }, this);
+};
+
+// ------------------------------------------------------------------ wake word on the TV (microWakeWord)
+// With a detector binary (bin/mww, built by native/build.sh) and a model (models/*.json + .tflite) the TV
+// listens for the wake word itself: one parec process (the "ear") feeds the detector all the time and,
+// during a conversation, Home Assistant as well, so nothing said right after the wake word is lost. No audio
+// leaves the TV until the wake word is heard. Without the binary, or with CFG.wake_word === 'ha', the
+// microphone is streamed to Home Assistant, which then detects the wake word (the 'wake' session below).
+var MWW_BIN = process.env.LGTV_ASSIST_MWW || path.join(__dirname, 'bin', 'mww');
+var MODELS_DIR = process.env.LGTV_ASSIST_MODELS || path.join(__dirname, 'models');
+var DEFAULT_WAKE = 'okay_nabu';
+var ear = null;                      // { src, parec, mww, model, listeners: [fn(pcm)] }
+var wake = { models: [], failures: [], broken: false };
+
+function loadWakeModels() {
+  var list = [];
+  try {
+    fs.readdirSync(MODELS_DIR).sort().forEach(function (f) {
+      if (!/\.json$/.test(f)) return;
+      var c = readJson(path.join(MODELS_DIR, f), null), m = c && c.micro;
+      if (!c || c.type !== 'micro' || !m || !(m.probability_cutoff > 0) || !(m.sliding_window_size >= 1)) return;
+      var file = path.join(MODELS_DIR, String(c.model || ''));
+      if (!fs.existsSync(file)) return;
+      list.push({ id: f.replace(/\.json$/, ''), word: String(c.wake_word || f), file: file,
+        cutoff: m.probability_cutoff, window: m.sliding_window_size, languages: c.trained_languages || [] });
+    });
+  } catch (e) {}
+  if (!fs.existsSync(MWW_BIN)) list = [];
+  return list;
+}
+wake.models = loadWakeModels();
+function wakeModel() {
+  if (CFG.wake_word === 'ha' || wake.broken || !wake.models.length) return null;
+  var want = CFG.wake_word || DEFAULT_WAKE;
+  return wake.models.filter(function (m) { return m.id === want; })[0] ||
+    wake.models.filter(function (m) { return m.id === DEFAULT_WAKE; })[0] || wake.models[0];
+}
+function wakeStatus() {
+  var m = wakeModel();
+  status.wake = m ? { on: 'tv', id: m.id, word: m.word } : { on: 'ha' };
+  status.wakeModels = wake.models.map(function (x) { return { id: x.id, word: x.word }; });
+  saveStatus();
+}
+wakeStatus();
+log('wake word:', wakeModel() ? wakeModel().word + ' (detected on the TV)' : 'detected by Home Assistant' +
+  (wake.models.length ? '' : ' (no detector in this build)'));
+
+// The microphone or the detector ended without being asked to. Seen on the TV: both children of the daemon
+// get SIGABRT a few ms after they were started when Home Assistant connects at that very moment (cause
+// unknown; started a second later they run fine). So: start again shortly; a microphone that is gone is
+// noticed by checkUsbMic. A detector that refuses its model, or keeps dying, makes Home Assistant detect the
+// wake word instead, so the TV never ends up deaf.
+function earFailed(why) {
+  stopEar();
+  var now = Date.now();
+  wake.failures = wake.failures.filter(function (t) { return now - t < 60000; }).concat([now]);
+  if (why === 'refused' || wake.failures.length >= 5) {
+    wake.broken = true;
+    log('wake word: giving up on the detector; Home Assistant detects the wake word');
+    wakeStatus();
+  }
+  scheduleListening(1000);
+}
+
+function stopEar() {
+  if (!ear) return;
+  var e = ear; ear = null;
+  try { e.parec.kill(); } catch (x) {}
+  try { e.mww.kill(); } catch (x) {}
+}
+function startEar(src, model) {
+  if (ear && ear.src === src && ear.model === model) return;
+  stopEar();
+  var e = ear = { src: src, model: model, listeners: [], parec: null, mww: null };
+  e.mww = spawnClean(MWW_BIN, [model.file, String(model.cutoff), String(model.window)], { stdio: ['pipe', 'pipe', 'pipe'] });
+  var errTail = '';
+  e.mww.stderr.on('data', function (d) { errTail = (errTail + d).slice(-400); });
+  e.mww.on('error', function () {});
+  e.mww.stdin.on('error', function () {});
+  var out = '';
+  e.mww.stdout.on('data', function (d) {
+    out += d;
+    var i;
+    while ((i = out.indexOf('\n')) >= 0) {
+      var p = out.slice(0, i).split(' '); out = out.slice(i + 1);
+      if (p[0] === 'wake' && ear === e) onLocalWake(model, parseFloat(p[2]));
+    }
+  });
+  // 'close', not 'exit': the error output must be read to the end first
+  e.mww.on('close', function (code, sig) {
+    if (ear !== e) { if (sig !== 'SIGTERM') log('wake word: old detector ended (' + (sig || code) + ')' + (errTail ? ': ' + errTail.trim() : '')); return; }
+    log('wake word: detector stopped (' + (sig || code) + ')' + (errTail ? ': ' + errTail.trim().split('\n').slice(-2).join(' | ') : ''));
+    earFailed(code === 2 || code === 3 ? 'refused' : 'stopped');
+  });
+  e.parec = spawnClean('parec', PA.concat(['-d', src, '--rate=16000', '--channels=1', '--format=s16le', '--latency-msec=40']));
+  e.parec.stdout.on('data', function (pcm) {
+    if (ear !== e) return;
+    if (e.mww.stdin.writable) e.mww.stdin.write(pcm);
+    for (var i = 0; i < e.listeners.length; i++) e.listeners[i](pcm);
+  });
+  e.parec.on('error', function () {});
+  var parecErr = '';
+  e.parec.stderr.on('data', function (d) { parecErr = (parecErr + d).slice(-300); });
+  e.parec.on('close', function (code, sig) {
+    if (ear !== e) return;
+    log('usb mic: parec exited (' + (sig || code) + ')' + (parecErr ? ': ' + parecErr.trim() : ''));
+    earFailed('parec');
+  });
+  log('wake word: listening for', model.word, 'on the TV');
+}
+
+// The detector heard the wake word: what Home Assistant's WAKE_WORD_END does in the other mode, then a
+// conversation that starts at speech-to-text.
+function onLocalWake(model, prob) {
+  if (session || player.proc) { log('wake word:', model.word, '(ignored: busy)'); return; }
+  log('wake word:', model.word, isNaN(prob) ? '' : prob.toFixed(2));
+  if (!va) { toast(T('d_no_ha')); return; }
+  duckTv();
+  if (CFG.wake_screen !== false && screen.on === false) setScreen(true, 'wake word');
+  toast(T('d_listening'), 'listen');
+  startSession({ type: 'vad', wake_word_phrase: model.word });
+}
 
 // ------------------------------------------------------------------ TV volume ducking
 var duck = { saved: null };
@@ -618,6 +752,7 @@ function startSession(opts) {
   if (type !== 'wake') s.maxTimer = setTimeout(function () { finishAudio('max length'); }, CFG.max_seconds * 1000);
   s.flags = type === 'ptt' ? 0 : type === 'wake' ? (E.VA_REQUEST_FLAG.USE_WAKE_WORD | E.VA_REQUEST_FLAG.USE_VAD) : E.VA_REQUEST_FLAG.USE_VAD;
   s.conversationId = opts.conversation_id || '';
+  s.wakeWordPhrase = opts.wake_word_phrase || '';
   // While an aborted run is still winding down, hold the request (the mic already buffers audio).
   if (staleUntil && Date.now() < staleUntil) { s.deferred = true; clearTimeout(staleTimer); staleTimer = setTimeout(staleClear, staleUntil - Date.now()); }
   else sendStart(s);
@@ -631,7 +766,7 @@ function startSession(opts) {
   } else {
     s.mic = new UsbMic(usb.source, onData);
   }
-  status.listening = type === 'wake'; saveStatus();
+  status.listening = type === 'wake' || !!ear; saveStatus();
 }
 
 function onMicData(s, pcm) {
@@ -679,7 +814,7 @@ var staleUntil = 0, staleTimer = null;
 
 function sendStart(s) {
   s.deferred = false;
-  s.client.send('VoiceAssistantRequest', { start: true, flags: s.flags, conversation_id: s.conversationId || '', wake_word_phrase: '' });
+  s.client.send('VoiceAssistantRequest', { start: true, flags: s.flags, conversation_id: s.conversationId || '', wake_word_phrase: s.wakeWordPhrase || '' });
 }
 function staleClear() {
   staleUntil = 0; clearTimeout(staleTimer);
@@ -704,7 +839,7 @@ function endSession(why) {
   clearTimeout(s.maxTimer);
   if (!s.audioEnded) { s.audioEnded = true; s.mic.close(); }
   session = null;
-  status.listening = false; saveStatus();
+  status.listening = !!ear; saveStatus();
   if (s.type !== 'wake' || s.woke || why !== 'run end') log('va: session end:', why);
   if (!player.proc) restoreTv();
   scheduleListening(why === 'run end' ? 300 : 1500);
@@ -712,6 +847,16 @@ function endSession(why) {
 
 // (Re)start the hands-free wake word session whenever nothing else is going on.
 function ensureListening() {
+  var model = CFG.hands_free !== false && usb.source ? wakeModel() : null;
+  if (model) {                           // the TV detects the wake word itself
+    if (!va && !ear) return;             // nothing to do with it before Home Assistant is there
+    if (session && session.type === 'wake') abortSession('wake word moved to the TV');
+    startEar(usb.source, model);
+    if (!status.listening && !session) { status.listening = true; saveStatus(); }
+    return;
+  }
+  stopEar();
+  if (status.listening && !session) { status.listening = false; saveStatus(); }
   if (CFG.hands_free === false || !usb.source || !va || session || player.proc || !handles) return;
   if (Date.now() < listenBackoff) return scheduleListening(listenBackoff - Date.now());
   restoreTv();
@@ -828,13 +973,15 @@ function pttUp() {
 var SETTINGS = path.join(DATA_DIR, 'settings.json');
 fs.watchFile(SETTINGS, { interval: 1000 }, function () {
   var next = readJson(SETTINGS, {});
-  ['toasts', 'hands_free', 'wake_screen', 'duck', 'duck_volume', 'mic_gain', 'max_seconds', 'tv_locale'].forEach(function (k) {
+  ['toasts', 'hands_free', 'wake_screen', 'duck', 'duck_volume', 'mic_gain', 'max_seconds', 'tv_locale', 'wake_word'].forEach(function (k) {
     if (next[k] !== undefined && next[k] !== CFG[k]) { log('settings:', k, '=', JSON.stringify(next[k])); CFG[k] = next[k]; }
   });
   // "lang" is removed from the file when the user goes back to automatic, so compare it as it is
   // (but not when the file could not be read at all, e.g. while it is being written)
   if (Object.keys(next).length && next.lang !== CFG.lang) { CFG.lang = next.lang; log('settings: lang =', next.lang || 'auto', '->', lang()); }
   if (usb.source && next.mic_gain !== undefined) configureUsbMic(usb.source);
+  wake.broken = false; wake.failures = []; wakeStatus();
+  if (CFG.hands_free === false || !wakeModel()) { stopEar(); if (!session) { status.listening = false; saveStatus(); } }
   if (CFG.hands_free === false && session && session.type === 'wake' && !session.woke) abortSession('hands-free off');
   else scheduleListening(300);
 });
@@ -856,6 +1003,7 @@ function shutdown() {
   try { if (fs.readFileSync(NOSPY_CLAIM, 'utf8').split(' ')[0] === String(process.pid)) fs.unlinkSync(NOSPY_CLAIM); } catch (e) {}
   mdns.stop();
   if (session) abortSession('shutdown');
+  stopEar();
   stopPlayback(true);
   setTimeout(function () { process.exit(0); }, 300);
 }

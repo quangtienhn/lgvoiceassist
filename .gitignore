@@ -3,3 +3,7 @@ token
 config.json
 dist/
 __pycache__/
+native/.deps/
+native/build/
+app/daemon/bin/
+app/daemon/models/
