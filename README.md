@@ -10,6 +10,116 @@ The app, its toasts on the TV and the entity names follow the TV menu language: 
 
 Tested on: LG OLED55CX (webOS 5.6.2, root via Homebrew Channel), Magic Remote MR20 (BLE), HA 2026.11.
 
+![The app on the TV](docs/screenshots/app-running.png)
+
+## Requirements
+**TV**
+- An LG webOS TV **rooted with [Homebrew Channel](https://github.com/webosbrew/webos-homebrew-channel)**. Root is
+  required (developer mode is not enough): the app takes over LG's voice service. Homebrew Channel → Settings must
+  show *Root status: ok*. To root a TV, see [webosbrew.org/rooting](https://www.webosbrew.org/rooting/). Which
+  method works depends on the TV's firmware.
+- Only webOS 5 (LG CX, 2020) has been tested. Other webOS versions with Homebrew Channel will probably work, but
+  that is not verified.
+- For **push-to-talk:** a Magic Remote with a microphone button.
+- For **hands-free** (wake word): a USB microphone plugged into the TV (any USB audio class device, e.g. a cheap
+  C-Media dongle). The CX has no far-field microphone of its own.
+- **SSH** enabled in Homebrew Channel (Settings → *SSH Server*) for installing from a computer. The user is `root`;
+  the password is `alpine` until you add a key.
+- If you use *Life's Good Without Spying* with its voice block on, you also need to turn on the app's two exceptions.
+  The app tells you when this is needed (see [Installation](#installation-on-the-tv), step 5).
+
+**Home Assistant**
+- The built-in **ESPHome** integration (nothing to install; no ESPHome add-on or Device Builder is needed).
+- A **voice assistant** (Settings → Voice assistants) with speech-to-text and text-to-speech in your language,
+  e.g. Home Assistant Cloud, Whisper + Piper, or Google.
+- Only for wake word mode *by Home Assistant*: a wake word engine such as the openWakeWord add-on. With the
+  default, the wake word is detected on the TV.
+- Home Assistant must reach the TV on TCP port **6053**. For automatic discovery, mDNS must also work between them,
+  i.e. the same network or an mDNS reflector.
+
+## Installation on the TV
+The app is not in the default Homebrew Channel repository yet, so it is installed from an `.ipk` file. Each
+[GitHub release](https://github.com/xrogers/lgvoiceassist/releases/latest) carries
+`io.github.xrogers.lgtvassist_<version>_all.ipk` and `SHA256SUMS`. You can also build it yourself
+(see [Build from source](#build-from-source)).
+
+1. **Download** the `.ipk` from the latest release (and check it with `sha256sum -c SHA256SUMS --ignore-missing`).
+2. **Install** it with one of:
+   - **SSH** (the TV's IP address is under *Settings → Network*):
+     ```sh
+     scp io.github.xrogers.lgtvassist_*_all.ipk root@TV:/tmp/lgtvassist.ipk
+     ssh root@TV 'luna-send -i luna://com.webos.appInstallService/dev/install \
+       "{\"id\":\"com.ares.defaultName\",\"ipkUrl\":\"/tmp/lgtvassist.ipk\",\"subscribe\":true}"'
+     ```
+     `luna-send` prints the progress. When a message with `"state":"installed"` (`"statusValue":30`) appears,
+     press Ctrl+C. The file in `/tmp` is deleted when the TV restarts.
+   - **[webOS Dev Manager](https://github.com/webosbrew/dev-manager-desktop)** (desktop app): add the TV as a rooted
+     device (port 22, user `root`), then *Apps → Install* and pick the `.ipk`.
+3. **Open LG TV Assist** from the TV's app list. On the first run the service has no root yet:
+
+   ![First run: Grant root access](docs/screenshots/app-first-run.png)
+
+   Select **Grant root access (Homebrew)**. The app asks Homebrew Channel to elevate its service, then starts it.
+   The service installs the boot hook `/var/lib/webosbrew/init.d/60-lgtv-assist`, so from then on it starts by
+   itself whenever the TV starts. If the app asks you to, open it again.
+4. The card **Service on the TV** now says *running*, and the hint tells you how to add the TV to Home Assistant:
+
+   ![Waiting for Home Assistant](docs/screenshots/app-waiting.png)
+
+5. *Life's Good Without Spying* only: if it blocks the voice services, a yellow card appears. Select **Open Life's
+   Good Without Spying**, turn on *LG TV Assist: voiceinput* and *LG TV Assist: voiceconductor* under
+   **Exceptions**, then apply the changes.
+
+**Updating:** install the new `.ipk` the same way (the settings and the encryption key are kept). Then open the app
+and select **Grant root access (Homebrew)** again, because every manual install resets the service to non-root.
+After that select **Restart**. Apps installed from a Homebrew Channel repository are re-elevated automatically; a
+manual install is not.
+
+**Uninstalling:** select **Turn off** in the app (this hands the mic button back to LG's assistant), then remove the
+app from the TV's app list. The boot hook deletes itself on the next start once the app is gone. To also remove the
+settings and the key, delete `/media/developer/lgtv-assist/`. In Home Assistant, delete the "LG TV" device or its
+ESPHome entry.
+
+## Setting up in Home Assistant
+1. **Add the TV.** Go to **Settings → Devices & services**. The TV appears under *Discovered* as an ESPHome device
+   named **LG TV**. Select **Add** and confirm. If it does not appear (e.g. no mDNS across networks), select
+   **Add integration → ESPHome** and enter the TV's IP address with port **6053**.
+   - There is **no encryption key to type**. Home Assistant generates a key and hands it to the TV while adding it
+     (see [Encryption](#encryption)). Leave the key field empty if you are asked for one.
+   - In the app, *Home Assistant* changes to *connected* and **Encryption** to *on*.
+2. **Pick the area.** Home Assistant asks for an area while adding the device. The voice assistant uses it to resolve
+   commands such as "turn on the lights" without a room name.
+3. **Choose the assistant** on the device page (**Settings → Devices & services → ESPHome → LG TV**):
+
+   ![The TV's device page in Home Assistant](docs/screenshots/ha-device.png)
+
+   - **Assistant** selects the voice assistant (pipeline) that this TV uses. *Preferred* is the one starred under
+     Settings → Voice assistants. *Assistant 2* is for a second wake word, which the TV does not use.
+   - **Finished speaking detection** sets how long a pause ends the command (hands-free).
+   - **Wake word** / **Wake word 2** stay *unavailable*: choose the wake word on the TV instead (the app's
+     **Wake word** button; see [Wake word on the TV](#wake-word-on-the-tv)).
+   - **Assist satellite** is the voice entity. Announcements (`assist_satellite.announce`), timers set by voice,
+     and the *Set up voice assistant* wizard all use it.
+   - **Media Player** plays TTS, announcements and audio URLs through the TV's speakers
+     (`media_player.play_media`, `tts.speak`). It does not control the TV itself; LG's own *webOS TV* integration
+     does that.
+   - **Screen** turns the TV's picture on or off; the sound keeps playing. With *Wake screen: on* in the app, the
+     wake word turns the picture on.
+4. **Voice assistant settings** (Settings → Voice assistants → your assistant):
+   - The speech-to-text **language** should match how you speak to the TV. The TV's toasts and entity names follow
+     the TV menu language, independently of this.
+   - If you choose wake word *by Home Assistant* in the app, the TV streams the microphone to Home Assistant all
+     the time. The assistant then needs a **wake word engine**, and its wake word setting applies. This is not
+     needed for the default on-TV wake word.
+   - If you use an LLM conversation agent, consider not exposing `media_player.lg_tv_media_player` to it
+     (Settings → Voice assistants → Expose). Otherwise the agent may pick it for "play …" requests that belong to
+     your music player.
+
+**Using it:** hold the remote's **mic button**, speak, then release. With a USB microphone, say the wake word
+(*Okay Nabu* by default) followed by the command; the TV lowers its volume while it listens. The reply is spoken
+through the TV and also shown as a toast (the app's **Toasts** button controls the toasts). The app's
+*Last conversation* card shows what was understood and the answer; **Full reply** shows the whole text.
+
 ## How it works
 1. **Mic button:** `com.webos.starfish.keyfilters` sends the mic key to `com.webos.service.voiceconductor`
    (`//setInputEvent {"event":"down"|"up","inputType":"hold"}`). The daemon holds that luna name; LG's
@@ -39,22 +149,21 @@ tools/build_ipk.py                    builds dist/*.ipk + the Homebrew Channel m
 tools/check_i18n.js                   checks that all translations are complete and used
 tools/test_*.{js,py}, daemon_harness* tests (see below)
 tools/make_icons.py                   draws the icons
+tools/app_screenshots.py              renders docs/screenshots/app-*.png from the real UI
 legacy/                               first prototype (TV → HA WebSocket with a token)
 .github/workflows/release.yml         CI build; a tag vX.Y.Z publishes a GitHub release
 ```
 
-## Build and install (local)
+## Build from source
 ```sh
 native/build.sh webos                           # wake word detector + models (optional; without it HA detects the wake word)
 python3 tools/build_ipk.py                      # → dist/io.github.xrogers.lgtvassist_<ver>_all.ipk (+ manifest)
-scp dist/*.ipk root@TV:/tmp/lgtvassist.ipk
-ssh root@TV 'luna-send -i luna://com.webos.appInstallService/dev/install \
-  "{\"id\":\"com.ares.defaultName\",\"ipkUrl\":\"/tmp/lgtvassist.ipk\",\"subscribe\":true}"'
 ```
-Open the app on the TV. On the first run (and after each reinstall) choose **Nadaj uprawnienia (Homebrew)**:
-the app calls `org.webosbrew.hbchannel.service/elevateService` and starts the service, which installs the boot hook
-`/var/lib/webosbrew/init.d/60-lgtv-assist`. Then in HA go to **Settings → Devices & services**, where the TV appears as a
-discovered ESPHome device ("LG TV"). To add it manually, use ESPHome with host = TV IP and port 6053.
+Then install `dist/*.ipk` as described in [Installation](#installation-on-the-tv). "Grant root access" calls
+`org.webosbrew.hbchannel.service/elevateService` for the service and then starts it.
+
+The screenshots in `docs/screenshots/app-*.png` are rendered from the real UI with example data:
+`tools/app_screenshots.py` (needs Playwright).
 
 ## Wake word on the TV
 With a USB microphone the TV listens for the wake word **itself** (microWakeWord, the engine of ESPHome voice
