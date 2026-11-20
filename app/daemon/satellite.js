@@ -19,7 +19,7 @@ var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('
 var I18N = require('../i18n');   // translations shared with the app UI (app folder)
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.7.0';
+var VERSION = '0.8.0';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 // LGTV_ASSIST_TMP: prefix of the log/status/pid files (default keeps the paths the TV service reads); for tests
 var TMP = process.env.LGTV_ASSIST_TMP || '/tmp/lgtv-assist';
@@ -55,6 +55,9 @@ var MAC = NET.mac.toUpperCase();
 // ------------------------------------------------------------------ status (for the app UI)
 var status = { mic: 'starting', usbMic: null, listening: false, version: VERSION, started: new Date().toISOString(), ip: NET.ip, port: CFG.port, name: CFG.name,
   ha: null, haSince: null, lastSession: null, lastText: null, lastReply: null, lastError: null };
+// What the app's Diagnostics panel shows (see "diagnostics" below)
+var diag = status.diag = { vc: { held: false, since: null, attempts: 0, error: null, methods: 0, api: false },
+  keys: { count: 0, last: null, event: null, from: null }, calls: [], mic: null, sys: null, platform: null, keyTest: null };
 function saveStatus() { try { fs.writeFileSync(STATUS, JSON.stringify(status)); } catch (e) {} }
 saveStatus();
 try { fs.writeFileSync(TMP + '.daemon.pid', String(process.pid)); } catch (e) {}
@@ -76,6 +79,127 @@ function toast(text, kind) {
   lunaSend('luna://com.webos.notification/createToast',
     { message: String(text).slice(0, 180), sourceId: 'com.webos.service.voiceconductor', noaction: true });
 }
+
+// ------------------------------------------------------------------ diagnostics
+// For the app's Diagnostics panel (status.diag) and for bug reports: what stands between the mic button and
+// us. Besides what is recorded where it happens (the voiceconductor name, every request to it, the remote's
+// audio), a check of the system every 30 s, the platform, and a mic button test on demand (SIGUSR2 from the
+// app service): ls-monitor shows for 12 s which voice messages cross the system bus while the user presses.
+function capture(cmd, args, cb, ms) {
+  var out = '', done = false, p = spawnClean(cmd, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+  var t = setTimeout(function () { try { p.kill(); } catch (e) {} }, ms || 5000);
+  function end(code) { if (done) return; done = true; clearTimeout(t); cb(out, code); }
+  p.stdout.on('data', function (d) { out = (out + d).slice(-16384); });
+  p.on('error', function () { end(127); });
+  p.on('close', end);
+  return p;
+}
+function pidsOf(re) {
+  var out = [];
+  try {
+    fs.readdirSync('/proc').forEach(function (p) {
+      if (!/^\d+$/.test(p)) return;
+      try { if (re.test(fs.readFileSync('/proc/' + p + '/cmdline', 'utf8').split('\0')[0])) out.push(+p); } catch (e) {}
+    });
+  } catch (e) {}
+  return out;
+}
+// a unit masked by a symlink to /dev/null, as Glasshouse does for services it switches off (under /run)
+function unitMasked(unit) {
+  return ['/run/systemd/system/', '/etc/systemd/system/'].some(function (d) {
+    try { return fs.readlinkSync(d + unit) === '/dev/null'; } catch (e) { return false; }
+  });
+}
+var HID_SERVICE = '/usr/share/luna-service2/services.d/com.webos.service.voiceinput.hidraw.service';
+var APPS_DIR = process.env.LGTV_ASSIST_APPS_DIR || '/media/developer/apps/usr/palm/applications';
+function sysCheck() {
+  var mounts = '', apps = [];
+  try { mounts = fs.readFileSync('/proc/mounts', 'utf8'); } catch (e) {}
+  try { apps = fs.readdirSync(APPS_DIR); } catch (e) {}
+  diag.sys = {
+    at: new Date().toISOString(),
+    lgVc: pidsOf(/(^|\/)voiceconductor$/),                 // LG's own (our stub is a shell script: argv[0] is the shell)
+    vcBin: fs.existsSync('/usr/sbin/voiceconductor'),
+    vcStub: mounts.indexOf(' /usr/sbin/voiceconductor ') >= 0,
+    vi: pidsOf(/(^|\/)voiceinput$/),
+    viStub: mounts.indexOf(' /usr/sbin/voiceinput ') >= 0,
+    viMasked: unitMasked('voiceinput.service'),
+    hid: fs.existsSync(HID_SERVICE),                       // newer TVs capture the remote in a separate process
+    hidRun: pidsOf(/(^|\/)voiceinput_hidraw$/),
+    hidMasked: unitMasked('voiceinput_hidraw.service') || unitMasked('voiceinput-hidraw.service'),
+    glasshouse: apps.filter(function (a) { return /glasshouse/i.test(a); })
+  };
+  saveStatus();
+}
+function platformInfo() {
+  var p = diag.platform = {};
+  try { p.release = fs.readFileSync('/etc/starfish-release', 'utf8').split('\n')[0].trim().slice(0, 120); } catch (e) {}
+  capture('nyx-cmd', ['OSInfo', 'query', 'webos_release'], function (out) {
+    p.webos = out.trim().split('\n').pop().replace(/[^0-9A-Za-z._-]/g, '').slice(0, 30) || undefined;
+    capture('luna-send', ['-n', '1', '-w', '3000', 'luna://com.webos.service.tv.systemproperty/getSystemInfo',
+      '{"keys":["modelName","firmwareVersion","sdkVersion"]}'], function (out2) {
+      try {
+        var j = JSON.parse(out2.trim().split('\n').pop());
+        ['modelName', 'firmwareVersion', 'sdkVersion'].forEach(function (k) { if (typeof j[k] === 'string') p[k] = j[k].slice(0, 40); });
+      } catch (e) {}
+      log('platform: webOS', p.webos || '?', 'sdk', p.sdkVersion || '?', 'model', p.modelName || '?', 'firmware', p.firmwareVersion || '?', '|', p.release || '');
+      saveStatus();
+    });
+  });
+}
+var KEYTEST_SECONDS = +process.env.LGTV_ASSIST_KEYTEST_S || 12;
+var VOICE_BUS = /voice|inputevent|speech|thinq|keyfilter|\bmic\b|alexa/i;
+// ls-monitor prints each message twice (TX by the sender, RX by the receiver), with a time, a serial number and
+// connection ids: e.g. "82138.493 TX call 4 com.webos.lunasend-10238 (nfPnUocb) com.webos.service.voiceconductor
+// (sKph4S9l) (null) //setInputEvent «{...}»". Keep one copy, without the numbers, and count repeats (the mic
+// retrying, for example) instead of filling the list with them.
+function busLine(l) {
+  if (/\sRX\s+(call|return|signal)\s/.test(l) || /\/com\/palm\/luna\/private\/cancel/.test(l)) return null;
+  return l.replace(/\s+/g, ' ').trim()
+    .replace(/^\S+\s+(\[\s*[\d.]+\]\s+)?TX\s+/, '')       // time (and uptime), direction
+    .replace(/^(call|return|signal)\s+\d+\s+/, '$1 ')      // serial number
+    .replace(/\s\([A-Za-z0-9]{8}\)/g, '')                  // connection ids
+    .replace(/\s\(null\)/g, '')
+    .replace(/(com\.webos\.lunasend)-\d+/g, '$1')
+    .slice(0, 300);
+}
+function keyTest() {
+  if (diag.keyTest && diag.keyTest.state === 'running') return;
+  var kt = diag.keyTest = { state: 'running', started: new Date().toISOString(), seconds: KEYTEST_SECONDS, keys0: diag.keys.count,
+    keys: 0, lines: [], monitor: null };
+  var seen = {};
+  log('diag: mic button test, ' + KEYTEST_SECONDS + ' s');
+  sysCheck();
+  var buf = '', p = spawnClean('ls-monitor', [], { stdio: ['ignore', 'pipe', 'ignore'] });
+  p.stdout.on('data', function (d) {
+    var lines = (buf + d).split('\n');
+    buf = lines.pop().slice(-4096);
+    lines.forEach(function (l) {
+      kt.monitor = true;
+      if (!VOICE_BUS.test(l)) return;
+      var s = busLine(l);
+      if (!s) return;
+      if (seen.hasOwnProperty(s)) { seen[s].n++; kt.lines[seen[s].i] = s + ' (x' + seen[s].n + ')'; return; }
+      if (kt.lines.length >= 40) return;
+      seen[s] = { i: kt.lines.length, n: 1 };
+      kt.lines.push(s);
+    });
+  });
+  p.on('error', function () { kt.monitor = false; });
+  p.on('close', function (code) { if (code === 127) kt.monitor = false; });
+  setTimeout(function () {
+    try { p.kill(); } catch (e) {}
+    kt.state = 'done'; kt.keys = diag.keys.count - kt.keys0;
+    if (kt.monitor === null) kt.monitor = true;          // it ran, the bus was quiet
+    log('diag: test done,', kt.keys, 'mic button event(s),', kt.monitor ? kt.lines.length + ' voice message(s) on the bus' : 'no ls-monitor');
+    kt.lines.forEach(function (l) { log('diag: bus', l); });
+    saveStatus();
+  }, KEYTEST_SECONDS * 1000);
+  saveStatus();
+}
+process.on('SIGUSR2', keyTest);
+setTimeout(function () { sysCheck(); platformInfo(); }, 0);
+setInterval(sysCheck, 30000);
 
 // ------------------------------------------------------------------ language
 // CFG.lang: a language picked in the app. Otherwise the TV menu language: from LG's settings service
@@ -102,9 +226,27 @@ function watchLocale(onFirst) {
 // ------------------------------------------------------------------ luna: be "voiceconductor"
 var VC = 'com.webos.service.voiceconductor';
 var APP_ID = 'io.github.xrogers.lgtvassist';
-var VC_ANSWERS = { '/': { setInputEvent: {}, getSupportedLanguages: { voiceEngines: {}, voiceLanguages: {} } },
-  '/interactor': { register: { subscribed: true } } };
+var VC_ANSWERS = { setInputEvent: {}, getSupportedLanguages: { voiceEngines: {}, voiceLanguages: {} }, register: { subscribed: true } };
 var handles = null;
+
+// We register every method LG's service declares (its luna API file), not only the ones we use: a
+// caller then reaches us instead of getting "Unknown method" from the hub, which we would never see.
+// So if a firmware sends the mic button some other way, it shows up in the log and the Diagnostics panel.
+// Methods we don't implement answer with an error, as they did while LG's service was simply stopped.
+var VC_API = process.env.LGTV_ASSIST_VC_API || '/usr/share/luna-service2/api-permissions.d/' + VC + '.api.json';
+function vcMethods() {
+  var methods = {}, api = false;
+  function add(cat, m) { (methods[cat] = methods[cat] || {})[m] = 1; }
+  try {
+    (fs.readFileSync(VC_API, 'utf8').match(/com\.webos\.service\.voiceconductor\/[A-Za-z0-9_\/]+/g) || []).forEach(function (p) {
+      var rest = p.slice(VC.length), at = rest.lastIndexOf('/'), m = rest.slice(at + 1);
+      if (m && m !== '*') { add(rest.slice(0, at) || '/', m); api = true; }
+    });
+  } catch (e) {}
+  ['/', '/system'].forEach(function (cat) { add(cat, 'setInputEvent'); add(cat, 'getSupportedLanguages'); });
+  add('/interactor', 'register');
+  return { methods: methods, api: api };
+}
 
 // Life's Good Without Spying may answer for voiceconductor with its own stand-in. With our "claim"
 // exception turned on, it steps aside for the process named in its claim file (pid, start time, app id;
@@ -138,31 +280,59 @@ function nospyClaim() {
   return true;
 }
 
+// who called (the hub knows the sender's service name or app id; which one depends on the caller)
+function sender(msg) {
+  var s = '';
+  ['senderServiceName', 'applicationID', 'sender'].some(function (f) {
+    try { s = typeof msg[f] === 'function' ? String(msg[f]() || '') : ''; } catch (e) { s = ''; }
+    return s;
+  });
+  return s || '?';
+}
+
 function onVcRequest(msg) {
-  var body = {}; try { body = JSON.parse(msg.payload() || '{}'); } catch (e) {}
-  var r = JSON.parse(JSON.stringify((VC_ANSWERS[msg.category()] || {})[msg.method()] || {}));
-  r.returnValue = true; msg.respond(JSON.stringify(r));
-  if (msg.method() === 'setInputEvent') {
-    if (body.event === 'down') pttDown(); else if (body.event === 'up') pttUp();
-  }
+  var raw = String(msg.payload() || '{}'), body = {}; try { body = JSON.parse(raw); } catch (e) {}
+  var cat = msg.category(), m = msg.method(), from = sender(msg), known = VC_ANSWERS.hasOwnProperty(m);
+  var r = known ? JSON.parse(JSON.stringify(VC_ANSWERS[m])) : { errorCode: -1, errorText: 'not supported by LG TV Assist' };
+  r.returnValue = known; msg.respond(JSON.stringify(r));
+  var name = (cat === '/' ? '' : cat) + '/' + m;
+  diag.calls.unshift({ t: new Date().toISOString(), m: name, from: from, event: body.event });
+  if (diag.calls.length > 10) diag.calls.length = 10;
+  if (m === 'setInputEvent') {
+    diag.keys.count++; diag.keys.last = new Date().toISOString(); diag.keys.event = body.event || '?'; diag.keys.from = from;
+    if (body.event === 'down') pttDown(from); else if (body.event === 'up') pttUp(from);
+    else log('key: mic', name, 'from', from, raw.slice(0, 160));
+  } else log('vc:', name, 'from', from, raw.slice(0, 160));
+  saveStatus();
 }
 
 function registerVc(attempt) {
   attempt = attempt || 0;
+  var reg = vcMethods(), n = 0;
   try {
     var hs = [false, true].map(function (pub) {
       var h = new palmbus.Handle(VC, pub);
-      Object.keys(VC_ANSWERS).forEach(function (cat) {
-        Object.keys(VC_ANSWERS[cat]).forEach(function (m) { h.registerMethod(cat, m); });
+      n = 0;
+      Object.keys(reg.methods).forEach(function (cat) {
+        Object.keys(reg.methods[cat]).forEach(function (m) { h.registerMethod(cat, m); n++; });
       });
       h.addListener('request', onVcRequest);
       return h;
     });
     handles = hs;
-    status.mic = 'ok'; saveStatus();
-    log('registered', VC);
+    status.mic = 'ok';
+    diag.vc = { held: true, since: new Date().toISOString(), attempts: attempt, error: null, methods: n, api: reg.api };
+    saveStatus();
+    log('registered', VC, '(' + n + ' methods' + (reg.api ? ', from ' + VC_API : '') + ')');
   } catch (e) {
-    if (attempt === 0) log('luna:', VC, 'is taken (' + e.message + '); retrying');
+    diag.vc.held = false; diag.vc.attempts = attempt + 1; diag.vc.error = e.message;
+    // keep a trace now and then, with what the check finds (e.g. LG's voiceconductor still running)
+    if (attempt % 30 === 0) {
+      sysCheck();
+      log('luna:', VC, 'is taken (' + e.message + '); retrying' + (attempt ? ' (attempt ' + (attempt + 1) + ')' : ''),
+        diag.sys && diag.sys.lgVc.length ? '- LG voiceconductor runs as pid ' + diag.sys.lgVc.join(',') : '');
+    }
+    saveStatus();
     nospyClaim();
     setTimeout(function () { registerVc(attempt + 1); }, attempt < 10 ? 1000 : 10000);
   }
@@ -197,14 +367,18 @@ Mic.prototype.open = function (attempt) {
       // remote may still be reconnecting (BLE) or the previous stream winding down
       if (attempt < 15) return setTimeout(function () { self.open(attempt + 1); }, 200);
       log('mic: voiceinput refused:', r.errorText || JSON.stringify(r));
+      diag.mic = { at: new Date().toISOString(), error: 'voiceinput: ' + (r.errorText || JSON.stringify(r)).slice(0, 200) }; saveStatus();
       return self.onFail && self.onFail(r.errorText || 'mic unavailable');
     }
+    // the socket's place differs between firmwares (/tmp on webOS 5, /var/voiceinput on newer ones): use the reply's
     if (r.socketPath && !self.sock) {
+      var d = self.diag = diag.mic = { at: new Date().toISOString(), openMs: Date.now() - self.t0, socket: String(r.socketPath), bytes: 0, error: null };
       self.sock = net.connect(r.socketPath);
-      self.sock.on('data', function (pcm) { if (!self.closed) self.onData(pcm); });
-      self.sock.on('error', function (e) { log('mic socket error', e.message); });
+      self.sock.on('data', function (pcm) { d.bytes += pcm.length; if (!self.closed) self.onData(pcm); });
+      self.sock.on('error', function (e) { log('mic socket error', e.message); d.error = 'socket ' + r.socketPath + ': ' + e.message; saveStatus(); });
       self.keep = setInterval(function () { viCall('restartTimer'); }, 2500);
-      log('mic: open after', Date.now() - self.t0, 'ms');
+      log('mic: open after', Date.now() - self.t0, 'ms', r.socketPath);
+      saveStatus();
       if (self.onOpen) self.onOpen();
     }
   });
@@ -214,6 +388,7 @@ Mic.prototype.close = function () {
   this.closed = true;
   clearInterval(this.keep);
   if (this.sock) { try { this.sock.destroy(); } catch (e) {} }
+  if (this.diag) { log('mic: closed,', this.diag.bytes, 'bytes'); saveStatus(); }
   var sub = this.sub, opened = !!this.sock;
   // Stop as the same client that started, then drop the subscription. Also when the socket isn't
   // open yet: voiceinput may already be capturing, and would refuse the next start for seconds.
@@ -954,8 +1129,8 @@ function onTimer(m) {
 }
 
 // ------------------------------------------------------------------ push-to-talk
-function pttDown() {
-  log('key: mic down');
+function pttDown(from) {
+  log('key: mic down', from ? 'from ' + from : '');
   if (session && session.type === 'wake' && !session.woke) {
     abortSession('ptt');               // the remote wins over hands-free listening
     clearTimeout(listenTimer);
@@ -963,8 +1138,8 @@ function pttDown() {
   if (session) return;
   startSession({ type: 'ptt' });
 }
-function pttUp() {
-  log('key: mic up');
+function pttUp(from) {
+  log('key: mic up', from ? 'from ' + from : '');
   if (session && session.ptt) finishAudio('key up');
 }
 

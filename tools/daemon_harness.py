@@ -7,8 +7,10 @@
 harness directory in $LGTV_HARNESS_DIR), e.g. a luna-send that answers, or a parec that produces audio.
 
 What it fakes (all inside a private temp dir, nothing is written to /tmp/lgtv-assist.* or the TV paths):
-  * `palmbus` (tools/daemon_harness/palmbus.js, on NODE_PATH)
-  * luna-send / pactl / parec / amixer / mpg123 / gst-play-1.0 / timeout: executables that do nothing, first on PATH
+  * `palmbus` (tools/daemon_harness/palmbus.js, on NODE_PATH); `d.luna_request(...)` plays in a request to a
+    service the daemon registered (e.g. the mic button), `d.luna_responses()` / `d.luna_methods()` show the result
+  * luna-send / pactl / parec / amixer / mpg123 / gst-play-1.0 / timeout / ls-monitor / nyx-cmd: executables that
+    do nothing, first on PATH
   * LGTV_ASSIST_DATA (settings.json) and LGTV_ASSIST_TMP (log, status, pid files)
   * UDP multicast: tools/daemon_harness/preload.js stops the mDNS responder from touching the network and
     records what it would have sent
@@ -27,7 +29,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SATELLITE = os.path.join(ROOT, "app", "daemon", "satellite.js")
-FAKE_TOOLS = ["luna-send", "pactl", "parec", "amixer", "mpg123", "gst-play-1.0", "timeout"]
+FAKE_TOOLS = ["luna-send", "pactl", "parec", "amixer", "mpg123", "gst-play-1.0", "timeout", "ls-monitor", "nyx-cmd"]
 
 
 def free_port():
@@ -37,8 +39,9 @@ def free_port():
 
 
 class DaemonHarness:
-    def __init__(self, settings=None, node=None, keep=False, fakes=None):
+    def __init__(self, settings=None, node=None, keep=False, fakes=None, env=None):
         self.settings = dict(settings or {})
+        self.env = dict(env or {})   # extra environment for the daemon
         self.fakes = dict(fakes or {})
         self.node = node or os.environ.get("LGTV_NODE") or shutil.which("node")
         self.keep = keep
@@ -74,6 +77,26 @@ class DaemonHarness:
     def key(self):
         return self.read_settings().get("api_key")
 
+    def luna_request(self, method, payload=None, category="/", sender="com.webos.surfacemanager",
+                     name="com.webos.service.voiceconductor", public=False):
+        with open(os.path.join(self.dir, "tmp", "luna-requests"), "a") as f:
+            f.write(json.dumps({"name": name, "category": category, "method": method, "payload": payload or {},
+                                "sender": sender, "public": public}) + "\n")
+
+    def luna_responses(self):
+        try:
+            with open(os.path.join(self.dir, "tmp", "luna-responses")) as f:
+                return [json.loads(line) for line in f if line.strip()]
+        except OSError:
+            return []
+
+    def luna_methods(self):
+        try:
+            with open(os.path.join(self.dir, "tmp", "luna-methods.json")) as f:
+                return json.load(f)
+        except OSError:
+            return {}
+
     def mdns_packets(self):
         try:
             with open(os.path.join(self.dir, "tmp", "mdns.b64")) as f:
@@ -106,6 +129,7 @@ class DaemonHarness:
             "LGTV_ASSIST_MWW": os.environ.get("LGTV_ASSIST_MWW") or os.path.join(ROOT, "native", "build", "host", "mww"),
             "LGTV_ASSIST_MODELS": os.environ.get("LGTV_ASSIST_MODELS") or os.path.join(ROOT, "app", "daemon", "models"),
         })
+        env.update(self.env)
         self.proc = subprocess.Popen(
             [self.node, "-r", os.path.join(HERE, "daemon_harness", "preload.js"), SATELLITE],
             env=env, stdout=subprocess.DEVNULL, stderr=open(os.path.join(self.dir, "tmp", "stderr.txt"), "w"),

@@ -11,6 +11,10 @@ if ! grep -q " /usr/sbin/voiceconductor " /proc/mounts; then
   mount --bind "$D/voiceconductor-stub" /usr/sbin/voiceconductor && touch /tmp/lgtv-assist.mounted
 fi
 systemctl stop voiceconductor.service 2>/dev/null
+# It may take a while to go (or not be a systemd service at all on some firmware): wait, then make sure.
+n=0
+while pidof voiceconductor >/dev/null 2>&1 && [ "$n" -lt 10 ]; do sleep 1; n=$((n + 1)); done
+p=$(pidof voiceconductor 2>/dev/null) && [ -n "$p" ] && kill $p 2>/dev/null
 systemctl start voiceinput.service 2>/dev/null
 if [ -f /tmp/lgtv-assist.pid ] && kill -0 "$(cat /tmp/lgtv-assist.pid)" 2>/dev/null; then exit 0; fi
 sh "$D/loop.sh" </dev/null >/dev/null 2>&1 &

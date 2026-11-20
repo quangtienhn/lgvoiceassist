@@ -53,8 +53,15 @@ var NOSPY = '/media/developer/apps/usr/palm/applications/ooo.lew.lifesgoodwithou
 var NOSPY_CTL = NOSPY + '/init/nospy-ctl.sh';
 var EXC_DIR = '/var/lib/webosbrew/lifesgoodwithoutspying.exceptions.d';
 var EXC_FILE = EXC_DIR + '/' + APP_ID;
-var EXC_CONTENT = 'keep voiceinput\nclaim com.webos.service.voiceconductor\n';
+// Newer TVs (webOS 25 and later) capture the remote's audio in a separate process, voiceinput_hidraw, which
+// nospy blocks with the rest of Voice: there we ask to keep it too.
+var HID_SERVICE = '/usr/share/luna-service2/services.d/com.webos.service.voiceinput.hidraw.service';
+function hasHid() { return fs.existsSync(HID_SERVICE); }
+function excContent() {
+  return 'keep voiceinput\n' + (hasHid() ? 'keep voiceinput_hidraw\n' : '') + 'claim com.webos.service.voiceconductor\n';
+}
 var KEY_KEEP = 'exception.' + APP_ID + ':keep:voiceinput';
+var KEY_KEEP_HID = 'exception.' + APP_ID + ':keep:voiceinput_hidraw';
 var KEY_CLAIM = 'exception.' + APP_ID + ':claim:com.webos.service.voiceconductor';
 var nospyCache = null, nospyAt = 0;
 
@@ -67,9 +74,10 @@ function nospyRegister() {
   if (!nospyInstalled()) return false;
   var cur = null;
   try { cur = fs.readFileSync(EXC_FILE, 'utf8'); } catch (e) {}
-  if (cur === EXC_CONTENT) return false;
+  var want = excContent();
+  if (cur === want) return false;
   try { fs.mkdirSync(EXC_DIR); } catch (e) {}
-  fs.writeFileSync(EXC_FILE, EXC_CONTENT);
+  fs.writeFileSync(EXC_FILE, want);
   nospyAt = 0;
   return true;
 }
@@ -89,10 +97,12 @@ function nospyStatus(cb) {
       voiceBlocked: applied('voice.stop') && stubs > 0,
       keep: applied(KEY_KEEP),
       claim: applied(KEY_CLAIM),
-      savedKeep: kv['saved.' + KEY_KEEP] === 'on',
+      hid: hasHid(),
+      keepHid: applied(KEY_KEEP_HID),
+      savedKeep: kv['saved.' + KEY_KEEP] === 'on' && (!hasHid() || kv['saved.' + KEY_KEEP_HID] === 'on'),
       savedClaim: kv['saved.' + KEY_CLAIM] === 'on'
     };
-    nospyCache.ok = !nospyCache.voiceBlocked || (nospyCache.keep && nospyCache.claim);
+    nospyCache.ok = !nospyCache.voiceBlocked || (nospyCache.keep && nospyCache.claim && (!nospyCache.hid || nospyCache.keepHid));
     nospyAt = Date.now();
     cb(nospyCache);
   });
@@ -169,6 +179,16 @@ service.register('setSettings', function (message) {
   var pid = restart && alive('/tmp/lgtv-assist.daemon.pid');
   if (pid) { try { process.kill(pid, 'SIGTERM'); } catch (e) {} }
   message.respond({ returnValue: true, settings: publicSettings(s), restarted: !!pid });
+});
+
+// Diagnostics: the daemon watches the system bus for a few seconds while the user presses the mic button
+// (results in status.daemon.diag.keyTest)
+service.register('keyTest', function (message) {
+  if (needRoot(message)) return;
+  var pid = alive('/tmp/lgtv-assist.daemon.pid');
+  if (!pid) return message.respond({ returnValue: false, errorText: 'the daemon is not running' });
+  try { process.kill(pid, 'SIGUSR2'); } catch (e) { return message.respond({ returnValue: false, errorText: e.message }); }
+  message.respond({ returnValue: true });
 });
 
 service.register('nospyRegister', function (message) {

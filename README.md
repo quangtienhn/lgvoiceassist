@@ -25,7 +25,7 @@ Tested on: LG OLED55CX (webOS 5.6.2, root via Homebrew Channel), Magic Remote MR
   C-Media dongle). The CX has no far-field microphone of its own.
 - **SSH** enabled in Homebrew Channel (Settings → *SSH Server*) for installing from a computer. The user is `root`;
   the password is `alpine` until you add a key.
-- If you use *Life's Good Without Spying* with its voice block on, you also need to turn on the app's two exceptions.
+- If you use *Life's Good Without Spying* with its voice block on, you also need to turn on the app's exceptions.
   The app tells you when this is needed (see [Installation](#installation-on-the-tv), step 5).
 
 **Home Assistant**
@@ -67,8 +67,8 @@ The app is not in the default Homebrew Channel repository yet, so it is installe
    ![Waiting for Home Assistant](docs/screenshots/app-waiting.png)
 
 5. *Life's Good Without Spying* only: if it blocks the voice services, a yellow card appears. Select **Open Life's
-   Good Without Spying**, turn on *LG TV Assist: voiceinput* and *LG TV Assist: voiceconductor* under
-   **Exceptions**, then apply the changes.
+   Good Without Spying**. Under **Exceptions**, turn on every *LG TV Assist* entry: voiceinput and voiceconductor,
+   and on newer TVs also voiceinput_hidraw. Then apply the changes.
 
 **Updating:** install the new `.ipk` the same way (the settings and the encryption key are kept). Then open the app
 and select **Grant root access (Homebrew)** again, because every manual install resets the service to non-root.
@@ -119,6 +119,46 @@ ESPHome entry.
 (*Okay Nabu* by default) followed by the command; the TV lowers its volume while it listens. The reply is spoken
 through the TV and also shown as a toast (the app's **Toasts** button controls the toasts). The app's
 *Last conversation* card shows what was understood and the answer; **Full reply** shows the whole text.
+
+## Troubleshooting
+The app's **Diagnostics** button shows what lies between the remote's mic button and Home Assistant:
+
+![The Diagnostics panel](docs/screenshots/app-diagnostics.png)
+
+The panel lists the TV (webOS version, model, firmware), then checks each step:
+- whether the service holds LG's mic button service (`com.webos.service.voiceconductor`), and whether LG's own
+  voice service is still running;
+- whether LG's `voiceinput` is running, which brings the remote's audio, and whether something has replaced it with
+  a stub or masked its systemd unit. Newer TVs also capture the audio in a separate service, `voiceinput_hidraw`,
+  and the panel checks that one too;
+- the last mic button press and who sent it, the last time the remote's audio was opened (how fast, how much
+  audio, from which socket), and the Home Assistant connection;
+- the last requests to the mic button service;
+- known interference: Glasshouse being installed, or Life's Good Without Spying blocking voice without the app's
+  exceptions turned on.
+
+**OK runs a 12-second mic button test.** Press and release the remote's mic button while it runs. The panel then
+says whether the press reached LG TV Assist. It also lists the voice messages that crossed the system bus
+(`ls-monitor`) during the test, so it shows where the button went instead:
+- **The press arrived, but there is no audio:** voiceinput (or voiceinput_hidraw) is stopped or blocked. Check the
+  privacy apps.
+- **Nothing arrived, and there were no voice messages on the bus:** something takes the button before any voice
+  service sees it. With Glasshouse, open its *Remote* tab and set the mic and AI buttons to *As LG has it*.
+  Glasshouse can also switch off services by masking their systemd units, so check that no voice service is
+  switched off there.
+- **Messages went to another service or method:** that firmware routes the button differently. Please report it
+  with the panel's contents and the log.
+
+For a bug report, attach `/tmp/lgtv-assist.log` and `/tmp/lgtv-assist.status.json` from the TV (over SSH). The log
+also records every request to the mic button service, with its sender, and the platform line written at start.
+
+Newer firmware: webOS 25 serves the remote's audio from `/var/voiceinput/` instead of `/tmp`; the app uses the
+socket path that voiceinput returns, so both work. The newer firmware also captures the audio in
+`voiceinput_hidraw`, and for it the app asks Life's Good Without Spying for one more exception,
+`keep voiceinput_hidraw`. Both come from
+[webos-localvoice](https://github.com/haywirephoenix/webos-localvoice) PR #1 and
+[lifesgoodwithoutspying](https://github.com/lewisdoesstuff/lifesgoodwithoutspying) PR #72.
+They have not been tested with this app on such a TV.
 
 ## How it works
 1. **Mic button:** `com.webos.starfish.keyfilters` sends the mic key to `com.webos.service.voiceconductor`
@@ -239,6 +279,10 @@ Builds are reproducible: the commit time is used as the timestamp of every archi
 ## Notes
 - Children are started through `spawnClean` (closes inherited fds); otherwise a lingering child keeps the luna hub
   socket and the voiceconductor name stays "already exists" after a restart.
+- The daemon registers every method listed in LG's API file for voiceconductor
+  (`/usr/share/luna-service2/api-permissions.d/com.webos.service.voiceconductor.api.json`), not only `setInputEvent`.
+  So whatever a firmware sends there reaches the daemon and is logged, instead of the hub answering "Unknown
+  method" unseen. Methods it doesn't implement answer with an error, as when LG's service is simply stopped.
 - Turning the app off (or uninstalling it and rebooting) gives the mic button back to LG's assistant.
 - Data/settings: `/media/developer/lgtv-assist/` (`settings.json`, `disabled` flag). Logs: `/tmp/lgtv-assist.log`.
 - Remote protocol (MR20, BLE, `hidraw` only while awake): voice report `0xFE`, 124 B = `FE seq 80 8B` + 2 × (`01 H2` + 57 B mSBC + pad).

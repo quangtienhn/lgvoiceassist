@@ -268,11 +268,118 @@ async def language_suite():
             await client.disconnect()
 
 
+def tmpfile(d, name, text):
+    p = os.path.join(d, name)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    return p
+
+
+# What ls-monitor prints while the mic button is pressed (as on an LG CX, webOS 5.6): every message twice (TX, RX),
+# the mic retrying twice, a cancel, and unrelated traffic
+LS_MONITOR_LINES = [
+    '82138.493 TX call 4 com.webos.surfacemanager (nfPnUocb) com.webos.service.voiceconductor (sKph4S9l) (null) //setInputEvent \u00ab{"event":"down","inputType":"hold"}\u00bb',
+    '82138.495 RX call 4 com.webos.service.voiceconductor (sKph4S9l) com.webos.surfacemanager (nfPnUocb) (null) //setInputEvent \u00ab{"event":"down","inputType":"hold"}\u00bb',
+    '82138.496 TX call 9 com.webos.app.home (aaaaaaaa) com.webos.service.tvpower (bbbbbbbb) (null) /power/getPowerState \u00ab{}\u00bb',
+    '82138.505 TX call 64 com.webos.service.voiceconductor (sKph4S9l) com.webos.service.voiceinput (marXVmgu) (null) //startStreaming \u00ab{"keyType":"thinQtv"}\u00bb',
+    '82138.505 RX call 64 com.webos.service.voiceinput (marXVmgu) com.webos.service.voiceconductor (sKph4S9l) (null) //startStreaming \u00ab{"keyType":"thinQtv"}\u00bb',
+    '82138.567 TX call 65 com.webos.service.voiceconductor (sKph4S9l) com.webos.service.voiceinput (marXVmgu) /com/palm/luna/private/cancel \u00ab{"token":64}\u00bb',
+    '82138.705 TX call 66 com.webos.service.voiceconductor (sKph4S9l) com.webos.service.voiceinput (marXVmgu) (null) //startStreaming \u00ab{"keyType":"thinQtv"}\u00bb',
+]
+LS_MONITOR = "#!/bin/sh\ncat <<'EOF'\n" + "\n".join(LS_MONITOR_LINES) + "\nEOF\nexec sleep 600\n"
+
+
+async def diag_suite():
+    """Diagnostics (status.diag) and the mic button path: every voiceconductor method declared in LG's API file is
+    registered, requests are recorded with their sender, a press starts a push-to-talk run in Home Assistant, the
+    system check finds Glasshouse, and the mic button test (SIGUSR2) reports what ls-monitor saw."""
+    import signal
+    import tempfile
+    import time
+    print("\n== diagnostics and the mic button ==")
+    tmp = tempfile.mkdtemp(prefix="lgtv-diag-")
+    api = tmpfile(tmp, "voiceconductor.api.json", json.dumps({"voiceconductor.api": [
+        "com.webos.service.voiceconductor/setInputEvent", "com.webos.service.voiceconductor/recognizeVoice",
+        "com.webos.service.voiceconductor/system/setInputEvent", "com.webos.service.voiceconductor/interactor/setContext",
+        "com.webos.service.voiceconductor/*"]}))
+    apps = os.path.join(tmp, "apps")
+    os.makedirs(os.path.join(apps, "com.example.glasshouse"))
+    os.makedirs(os.path.join(apps, "io.github.xrogers.lgtvassist"))
+    env = {"LGTV_ASSIST_VC_API": api, "LGTV_ASSIST_APPS_DIR": apps, "LGTV_ASSIST_KEYTEST_S": "2"}
+    fakes = {"luna-send": luna_send("en-GB"), "ls-monitor": LS_MONITOR}
+    with DaemonHarness(settings={"name": NAME, "encryption": False}, fakes=fakes, env=env) as d:
+        await wait_for(lambda: d.status().get("diag", {}).get("sys"), 5)
+        st = d.status()["diag"]
+        methods = d.luna_methods().get("com.webos.service.voiceconductor private", [])
+        check("diag: holds the voiceconductor name", st["vc"]["held"] and st["vc"]["api"], st["vc"])
+        check("diag: every method of LG's API file is registered (no wildcard), plus ours",
+              set(methods) == {"/setInputEvent", "/recognizeVoice", "/system/setInputEvent", "/interactor/setContext",
+                               "/getSupportedLanguages", "/system/getSupportedLanguages", "/interactor/register"}, methods)
+        check("diag: same methods on the public bus", d.luna_methods().get("com.webos.service.voiceconductor public") == methods)
+        check("diag: system check finds Glasshouse", st["sys"]["glasshouse"] == ["com.example.glasshouse"], st["sys"])
+
+        client = APIClient("127.0.0.1", d.port, None, expected_name=NAME)
+        await asyncio.wait_for(client.connect(login=True), 15)
+        voice = Voice(client)
+        await wait_for(lambda: "voice assistant subscribed" in d.log(), 5)
+        d.luna_request("setInputEvent", {"event": "down", "inputType": "hold"})
+        check("mic button down -> push-to-talk run starts in Home Assistant (flags 0)",
+              await wait_for(lambda: voice.starts == [0], 5), voice.starts)
+        check("mic button: logged with its sender", "key: mic down from com.webos.surfacemanager" in d.log())
+        d.luna_request("setInputEvent", {"event": "up"}, category="/system", sender="com.webos.service.keyfilters")
+        check("mic button up (on /system) -> logged", await wait_for(lambda: "key: mic up from com.webos.service.keyfilters" in d.log(), 5))
+        k = d.status()["diag"]["keys"]
+        check("diag: presses counted with the last sender", k["count"] == 2 and k["event"] == "up" and k["from"] == "com.webos.service.keyfilters", k)
+        d.luna_request("recognizeVoice", {"subscribe": True}, sender="com.webos.app.browser")
+        await wait_for(lambda: any(r["method"] == "/recognizeVoice" for r in d.luna_responses()), 5)
+        r = [x for x in d.luna_responses() if x["method"] == "/recognizeVoice"]
+        check("a declared method we don't implement: answered with an error, logged",
+              r and r[0]["response"]["returnValue"] is False and "vc: /recognizeVoice from com.webos.app.browser" in d.log(), (r, d.log()[-300:]))
+        d.luna_request("startSomethingNew", {})
+        await wait_for(lambda: any(x["method"] == "/startSomethingNew" for x in d.luna_responses()), 5)
+        r = [x for x in d.luna_responses() if x["method"] == "/startSomethingNew"]
+        check("an undeclared method: the hub answers Unknown method", r and "Unknown method" in r[0]["response"]["errorText"], r)
+        calls = d.status()["diag"]["calls"]
+        check("diag: last requests, newest first, with sender and event",
+              [c["m"] for c in calls][:3] == ["/recognizeVoice", "/system/setInputEvent", "/setInputEvent"] and calls[2]["event"] == "down", calls)
+
+        os.kill(d.proc.pid, signal.SIGUSR2)
+        check("mic button test: running", await wait_for(lambda: (d.status()["diag"].get("keyTest") or {}).get("state") == "running", 3))
+        d.luna_request("setInputEvent", {"event": "down"})
+        d.luna_request("setInputEvent", {"event": "up"})
+        await wait_for(lambda: d.status()["diag"]["keyTest"]["state"] == "done", 6)
+        kt = d.status()["diag"]["keyTest"]
+        check("mic button test: counts the presses during the test", kt["keys"] == 2, kt)
+        check("mic button test: keeps one copy of each voice message, without numbers, repeats counted",
+              kt["monitor"] is True and kt["lines"] == [
+                  'call com.webos.surfacemanager com.webos.service.voiceconductor //setInputEvent \u00ab{"event":"down","inputType":"hold"}\u00bb',
+                  'call com.webos.service.voiceconductor com.webos.service.voiceinput //startStreaming \u00ab{"keyType":"thinQtv"}\u00bb (x2)'], kt)
+        await client.disconnect()
+
+    # no ls-monitor on the TV
+    fakes["ls-monitor"] = "#!/bin/sh\nexit 127\n"
+    with DaemonHarness(settings={"name": NAME, "encryption": False}, fakes=fakes, env=env) as d:
+        os.kill(d.proc.pid, signal.SIGUSR2)
+        time.sleep(0.5)
+        await wait_for(lambda: (d.status()["diag"].get("keyTest") or {}).get("state") == "done", 6)
+        kt = d.status()["diag"]["keyTest"]
+        check("mic button test without ls-monitor: says so", kt["monitor"] is False and kt["keys"] == 0, kt)
+
+    # the name is held by someone else: the attempts and the error are reported
+    env2 = dict(env, LGTV_HARNESS_VC_TAKEN="1")
+    with DaemonHarness(settings={"name": NAME, "encryption": False}, fakes=fakes, env=env2) as d:
+        await wait_for(lambda: d.status().get("diag", {}).get("vc", {}).get("attempts", 0) >= 2, 6)
+        vc = d.status()["diag"]["vc"]
+        check("diag: name taken -> not held, attempts and error reported", not vc["held"] and vc["attempts"] >= 2 and "taken" in vc["error"], vc)
+        check("log: name taken", "is taken" in d.log())
+
+
 async def main():
     await session_suite(True)
     await session_suite(False)
     await local_wake_suite()
     await language_suite()
+    await diag_suite()
     print("\n%d passed, %d failed" % (sum(results), len(results) - sum(results)))
     return 0 if all(results) else 1
 

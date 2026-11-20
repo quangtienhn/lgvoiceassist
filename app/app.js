@@ -111,6 +111,78 @@
 
     fixFocus();
     fit();
+    if (panel && panel.kind === 'diag') updatePanel(diagHtml(s));
+  }
+
+  // ---------------- diagnostics panel: what stands between the mic button and the service (status.daemon.diag)
+  var VC_NAME = 'com.webos.service.voiceconductor';
+  function ago(iso) {
+    var s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+    if (!(s >= 0)) return '?';
+    if (s < 120) return s + ' s';
+    if (s < 7200) return Math.round(s / 60) + ' min';
+    return Math.floor(s / 3600) + ' h ' + Math.round((s % 3600) / 60) + ' min';
+  }
+  function clock(iso) { var d = new Date(iso); return isNaN(d) ? '?' : d.toTimeString().slice(0, 8); }
+  function diagHtml(s) {
+    var d = s.daemon || {}, g = d.diag || {}, sys = g.sys || {}, out = [];
+    function line(cls, key, params) { out.push('<div class="dg ' + cls + '"><span class="dot"></span>' + esc(t(key, params)) + '</div>'); }
+    function text(cls, str) { out.push('<div class="dg ' + cls + '">' + esc(str) + '</div>'); }
+    var p = g.platform || {};
+    text('head', 'LG TV Assist ' + (d.version || '?') + ' · webOS ' + (p.webos || '?') + (p.sdkVersion ? ' (SDK ' + p.sdkVersion + ')' : '') +
+      ' · ' + (p.modelName || '?') + (p.firmwareVersion ? ' · ' + p.firmwareVersion : ''));
+    if (!s.root) line('bad', 'dg_root_no');
+    if (!s.running) line('bad', 'dg_daemon_no');
+    else {
+      line('ok', 'dg_daemon_ok', { t: ago(d.started) });
+      var vc = g.vc || {};
+      if (vc.held) line('ok', 'dg_vc_ok', { name: VC_NAME, n: vc.methods });
+      else line('bad', 'dg_vc_no', { name: VC_NAME, err: vc.error || '?', n: vc.attempts || 0 });
+      if (sys.lgVc && sys.lgVc.length) line('bad', 'dg_lgvc', { pid: sys.lgVc.join(', ') });
+      if (sys.vcBin === false) line('warn', 'dg_vcbin', { path: '/usr/sbin/voiceconductor' });
+      if (sys.viStub) line('bad', 'dg_vi_stub');
+      else if (sys.viMasked) line('bad', 'dg_vi_masked');
+      else if (sys.vi && sys.vi.length) line('ok', 'dg_vi_ok');
+      else if (sys.vi) line('warn', 'dg_vi_idle');
+      if (sys.hid) {
+        if (sys.hidMasked) line('bad', 'dg_hid_masked');
+        else line(sys.hidRun && sys.hidRun.length ? 'ok' : 'warn', sys.hidRun && sys.hidRun.length ? 'dg_hid_run' : 'dg_hid_idle');
+      }
+      var k = g.keys || {};
+      if (k.count) line('ok', 'dg_key_ok', { t: ago(k.last), n: k.count, from: k.from || '?' });
+      else line('warn', 'dg_key_none');
+      var m = g.mic;
+      if (!m) line('dim', 'dg_mic_none');
+      else if (m.error) line('bad', 'dg_mic_err', { err: m.error });
+      else line('ok', 'dg_mic_ok', { ms: m.openMs, kb: Math.round((m.bytes || 0) / 1024), socket: m.socket || '?' });
+      line(d.ha ? 'ok' : 'warn', 'dg_ha', { v: d.ha ? t('ha_connected', { ha: d.ha }) : t('ha_waiting') });
+      if (sys.glasshouse && sys.glasshouse.length) line('warn', 'dg_glass');
+    }
+    var ns = s.nospy || {};
+    if (ns.installed && ns.voiceBlocked && !ns.ok) line('bad', 'dg_nospy');
+    var kt = s.running && g.keyTest;
+    if (kt && kt.state === 'running') {
+      line('warn', 'dg_test_run', { s: Math.max(0, Math.ceil((Date.parse(kt.started) + kt.seconds * 1000 - Date.now()) / 1000)) });
+    } else if (kt) {
+      line(kt.keys ? 'ok' : 'bad', kt.keys ? 'dg_test_ok' : 'dg_test_none', { n: kt.keys });
+      if (kt.monitor === false) line('warn', 'dg_test_nomon');
+      else if (kt.lines && kt.lines.length) { text('sub', t('dg_test_bus')); kt.lines.forEach(function (l) { text('mono', l); }); }
+      else line('warn', 'dg_test_quiet');
+    }
+    if (s.running) {
+      text('sub', t('dg_calls'));
+      if (g.calls && g.calls.length) g.calls.forEach(function (c) { text('mono', clock(c.t) + '  ' + c.m + (c.event ? ' ' + c.event : '') + '  ← ' + c.from); });
+      else text('mono', t('dg_calls_none'));
+    }
+    text('note', t('dg_files'));
+    return out.join('');
+  }
+  function keyTest() {
+    luna(SVC + 'keyTest', {}, function (r) {
+      if (!r.returnValue) { msg(t('msg_error', { err: r.errorText || '' })); return; }
+      state.fastUntil = Date.now() + 15000;   // follow the countdown every second
+      setTimeout(refresh, 300);
+    });
   }
 
   // Long translations, or every card showing at once, can outgrow the screen: scale the page down to fit.
@@ -192,6 +264,7 @@
       luna(SVC + 'setSettings', { wake_word: ids[(ids.indexOf(cur) + 1) % ids.length] }, function (r) { fail(r); setTimeout(refresh, 1500); });
     },
     log: function () { openLog(); },
+    diag: function () { openDiag(); },
     detail: function () { openDetail(); },
     wscreen: function () {
       var cur = !(state.status && state.status.settings && state.status.settings.wake_screen === false);
@@ -223,15 +296,17 @@
   }
   // ---------------- scrollable full-screen panel (last conversation / log)
   var panel = null, panelY = 0;   // panel: { kind: 'detail'|'log' }
-  function showPanel(kind, title, text, toEnd) {
+  function showPanel(kind, title, text, toEnd, html) {
     panel = { kind: kind };
     $('detailTitle').textContent = title;
-    $('detailFoot').textContent = t(kind === 'log' ? 'foot_log' : 'foot_detail');
-    $('detailText').textContent = text || '—';
-    $('detail').className = kind === 'log' ? 'log' : '';
+    $('detailFoot').textContent = t(kind === 'log' ? 'foot_log' : kind === 'diag' ? 'foot_diag' : 'foot_detail');
+    if (html) $('detailText').innerHTML = html; else $('detailText').textContent = text || '—';
+    $('detail').className = kind === 'detail' ? '' : kind;
     panelY = toEnd ? 1e9 : 0;
     scrollPanel(0);
   }
+  // new content for an open panel, keeping its scroll position
+  function updatePanel(html) { $('detailText').innerHTML = html; scrollPanel(0); }
   function closePanel() { panel = null; $('detail').className = 'hidden'; }
   function scrollPanel(delta) {
     var box = $('detail').querySelector('.body'), inner = $('detailText');
@@ -243,6 +318,12 @@
   function openLog() {
     luna(SVC + 'status', { log: 200 }, function (r) { showPanel('log', t('panel_log'), r.log || t('log_empty'), true); });
   }
+  function openDiag() {
+    luna(SVC + 'status', {}, function (r) {
+      var s = r.returnValue === false ? NO_ROOT : r;
+      showPanel('diag', t('panel_diag'), '', false, diagHtml(s));
+    });
+  }
 
   document.addEventListener('keydown', function (e) {
     if (panel) {
@@ -252,6 +333,7 @@
       else if (e.keyCode === 33) scrollPanel(-page);            // channel up / page up
       else if (e.keyCode === 34) scrollPanel(page);             // channel down / page down
       else if (e.keyCode === 13 && panel.kind === 'log') openLog();
+      else if (e.keyCode === 13 && panel.kind === 'diag') keyTest();
       else if (e.keyCode === 13 || e.keyCode === 461 || e.keyCode === 27) closePanel();
       e.preventDefault();
       return;
@@ -281,6 +363,7 @@
     else render(r.returnValue === false ? NO_ROOT : r);
   });
   setInterval(refresh, 3000);
+  setInterval(function () { if (state.fastUntil && Date.now() < state.fastUntil && panel && panel.kind === 'diag') refresh(); }, 1000);
 
   // launch parameter {"panel":"log"|"detail"} opens a panel directly (handy for testing)
   try {
