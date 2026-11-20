@@ -9,6 +9,8 @@ The app, its toasts on the TV and the entity names follow the TV menu language: 
 (English for anything else); the language can also be picked in the app.
 
 Tested on: LG OLED55CX (webOS 5.6.2, root via Homebrew Channel), Magic Remote MR20 (BLE), HA 2026.11.
+Reported working by a user: LG 65QNED80SRA (software 10.3.2, i.e. webOS 25), push-to-talk with the Magic Remote
+([#1](https://github.com/xrogers/lgvoiceassist/pull/1); spoken replies needed the fix in 0.8.1).
 
 ![The app on the TV](docs/screenshots/app-running.png)
 
@@ -18,8 +20,8 @@ Tested on: LG OLED55CX (webOS 5.6.2, root via Homebrew Channel), Magic Remote MR
   required (developer mode is not enough): the app takes over LG's voice service. Homebrew Channel → Settings must
   show *Root status: ok*. To root a TV, see [webosbrew.org/rooting](https://www.webosbrew.org/rooting/). Which
   method works depends on the TV's firmware.
-- Only webOS 5 (LG CX, 2020) has been tested. Other webOS versions with Homebrew Channel will probably work, but
-  that is not verified.
+- Tested on webOS 5 (LG CX, 2020); a user reports webOS 25 (LG QNED80, 2023) working. Other webOS versions with
+  Homebrew Channel will probably work, but that is not verified.
 - For **push-to-talk:** a Magic Remote with a microphone button.
 - For **hands-free** (wake word): a USB microphone plugged into the TV (any USB audio class device, e.g. a cheap
   C-Media dongle). The CX has no far-field microphone of its own.
@@ -277,6 +279,9 @@ and `SHA256SUMS` as a GitHub release. The manifest is what a Homebrew Channel re
 Builds are reproducible: the commit time is used as the timestamp of every archive entry.
 
 ## Notes
+- Players (`mpg123`, `gst-play-1.0`) are started directly and stopped by the daemon after 120 s. `timeout` is not
+  used, because its syntax differs between the TVs' BusyBox versions: 1.29 on webOS 5 only takes `timeout -t S`,
+  while 1.30 and later only take `timeout S`.
 - Children are started through `spawnClean` (closes inherited fds); otherwise a lingering child keeps the luna hub
   socket and the voiceconductor name stays "already exists" after a restart.
 - The daemon registers every method listed in LG's API file for voiceconductor

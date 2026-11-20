@@ -51,6 +51,19 @@ def luna_send(ui_locale):
 PACTL = ("#!/bin/sh\n"
          "case \"$*\" in *'list sources short'*) printf '3\\talsa_input.usb-Fake_Mic-00.analog-mono\\tmodule-alsa-card.c\\ts16le 1ch 48000Hz\\tRUNNING\\n' ;; esac\n"
          "exit 0\n")
+# Audio players: record how they were started (one line per call), then finish at once
+def player(name):
+    return "#!/bin/sh\nprintf '%s %s\\n' " + name + " \"$*\" >> \"$LGTV_HARNESS_DIR/tmp/player.log\"\nexit 0\n"
+
+
+def player_log(d):
+    try:
+        with open(os.path.join(d.dir, "tmp", "player.log"), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 # 16 kHz s16le mono in real time: sample n has the value n mod 65536, so loss, reordering or corruption shows
 PAREC = ("#!/bin/sh\n"
          "exec python3 -u -c '\n"
@@ -120,7 +133,8 @@ async def session_suite(encryption):
         settings["api_key"] = base64.b64encode(os.urandom(32)).decode()      # as provisioned by Home Assistant
     else:
         settings["encryption"] = False
-    with DaemonHarness(settings=settings, fakes={"luna-send": luna_send("pl-PL"), "pactl": PACTL, "parec": PAREC}) as d:
+    fakes = {"luna-send": luna_send("pl-PL"), "pactl": PACTL, "parec": PAREC, "mpg123": player("mpg123"), "gst-play-1.0": player("gst-play-1.0")}
+    with DaemonHarness(settings=settings, fakes=fakes) as d:
         client = APIClient("127.0.0.1", d.port, None, noise_psk=d.key if encryption else None, expected_name=NAME)
         await asyncio.wait_for(client.connect(login=True), 15)
         check(label + ": status file says encryption %s" % encryption, d.status().get("encryption") is encryption)
@@ -155,6 +169,12 @@ async def session_suite(encryption):
         fin = await client.send_voice_assistant_announcement_await_response("http://127.0.0.1:9/tts.mp3", 10, "Kolacja gotowa")
         check(label + ": announcement finished with success", fin.success is True, fin)
         check(label + ": announcement text is shown", "Kolacja gotowa" in luna_log(d))
+        # the player is started directly (no `timeout`: its options differ between BusyBox versions)
+        check(label + ": MP3 played by mpg123 itself, at full volume",
+              "mpg123 -q -f 32768 http://127.0.0.1:9/tts.mp3\n" in player_log(d), player_log(d))
+        fin = await client.send_voice_assistant_announcement_await_response("http://127.0.0.1:9/tts.wav", 10, "Kolacja gotowa")
+        check(label + ": WAV announcement played by gst-play-1.0 itself", fin.success is True and
+              "gst-play-1.0 -q --volume=1 http://127.0.0.1:9/tts.wav\n" in player_log(d), (fin, player_log(d)))
 
         # language picked in the app (settings.json) applies without a restart
         s = d.read_settings(); s["lang"] = "de"
@@ -374,12 +394,39 @@ async def diag_suite():
         check("log: name taken", "is taken" in d.log())
 
 
+async def playback_limit_suite():
+    """A player that never finishes is stopped after the limit, and the announcement still completes."""
+    import time
+    print("\n== playback limit ==")
+    hang = "#!/bin/sh\necho $$ > \"$LGTV_HARNESS_DIR/tmp/player.pid\"\nexec sleep 600\n"
+    with DaemonHarness(settings={"name": NAME, "encryption": False}, fakes={"luna-send": luna_send("en-GB"), "mpg123": hang},
+                       env={"LGTV_ASSIST_PLAY_MAX_S": "1"}) as d:
+        client = APIClient("127.0.0.1", d.port, None, expected_name=NAME)
+        await asyncio.wait_for(client.connect(login=True), 15)
+        t0 = time.time()
+        fin = await client.send_voice_assistant_announcement_await_response("http://127.0.0.1:9/stream.mp3", 15, "Hello")
+        took = time.time() - t0
+        check("stuck player: announcement completes after the limit (%.1f s)" % took, fin.success is True and 0.8 < took < 6, (fin, took))
+        check("stuck player: stop logged", "player: stopped after 1 s" in d.log(), d.log()[-400:])
+        with open(os.path.join(d.dir, "tmp", "player.pid")) as f:
+            pid = int(f.read())
+        await asyncio.sleep(0.3)
+        try:
+            os.kill(pid, 0)
+            gone = False
+        except ProcessLookupError:
+            gone = True
+        check("stuck player: process is gone", gone, pid)
+        await client.disconnect()
+
+
 async def main():
     await session_suite(True)
     await session_suite(False)
     await local_wake_suite()
     await language_suite()
     await diag_suite()
+    await playback_limit_suite()
     print("\n%d passed, %d failed" % (sum(results), len(results) - sum(results)))
     return 0 if all(results) else 1
 

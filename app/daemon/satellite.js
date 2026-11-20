@@ -19,7 +19,7 @@ var pb = require('./lib/pb'), msgs = require('./lib/messages'), Mdns = require('
 var I18N = require('../i18n');   // translations shared with the app UI (app folder)
 var M = msgs.M, E = msgs.E;
 
-var VERSION = '0.8.0';
+var VERSION = '0.8.1';
 var DATA_DIR = process.env.LGTV_ASSIST_DATA || '/media/developer/lgtv-assist';
 // LGTV_ASSIST_TMP: prefix of the log/status/pid files (default keeps the paths the TV service reads); for tests
 var TMP = process.env.LGTV_ASSIST_TMP || '/tmp/lgtv-assist';
@@ -58,7 +58,8 @@ var status = { mic: 'starting', usbMic: null, listening: false, version: VERSION
 // What the app's Diagnostics panel shows (see "diagnostics" below)
 var diag = status.diag = { vc: { held: false, since: null, attempts: 0, error: null, methods: 0, api: false },
   keys: { count: 0, last: null, event: null, from: null }, calls: [], mic: null, sys: null, platform: null, keyTest: null };
-function saveStatus() { try { fs.writeFileSync(STATUS, JSON.stringify(status)); } catch (e) {} }
+// written whole and then renamed, so the app service (or a test) never reads a half-written file
+function saveStatus() { try { fs.writeFileSync(STATUS + '.tmp', JSON.stringify(status)); fs.renameSync(STATUS + '.tmp', STATUS); } catch (e) {} }
 saveStatus();
 try { fs.writeFileSync(TMP + '.daemon.pid', String(process.pid)); } catch (e) {}
 
@@ -400,6 +401,7 @@ Mic.prototype.close = function () {
 
 // ------------------------------------------------------------------ player
 var MP_KEY = 0x4c475456;   // 'LGTV'
+var PLAY_MAX_S = +process.env.LGTV_ASSIST_PLAY_MAX_S || 120;   // longest a reply / announcement / URL may play
 var player = { proc: null, queue: [], state: E.MP_STATE.IDLE, volume: 1.0, muted: false, announcing: false, done: null };
 
 function playUrls(urls, announcement, done) {
@@ -423,11 +425,20 @@ function playNext() {
   }
   var scale = player.muted ? 0 : Math.round(32768 * player.volume);
   var p = /\.mp3(\?|$)/i.test(url) || !/\.(flac|wav|ogg|opus)(\?|$)/i.test(url)
-    ? spawnClean('timeout', ['-t', '120', 'mpg123', '-q', '-f', String(scale), url], { stdio: 'ignore' })
-    : spawnClean('timeout', ['-t', '120', 'gst-play-1.0', '-q', '--volume=' + (player.muted ? 0 : player.volume), url], { stdio: 'ignore' });
+    ? spawnClean('mpg123', ['-q', '-f', String(scale), url], { stdio: 'ignore' })
+    : spawnClean('gst-play-1.0', ['-q', '--volume=' + (player.muted ? 0 : player.volume), url], { stdio: 'ignore' });
   player.proc = p;
+  // A stream that never ends, or a stuck player, must not hold the speaker: stop it after PLAY_MAX_S. This is done
+  // here, not with `timeout`, whose syntax differs between the TVs' BusyBox versions (1.29 on webOS 5 only takes
+  // `timeout -t S`, 1.30 and later only `timeout S`).
+  var exited = false;
+  var limit = setTimeout(function () {
+    log('player: stopped after', PLAY_MAX_S, 's');
+    try { p.kill(); } catch (e) {}
+    setTimeout(function () { if (!exited) { try { p.kill('SIGKILL'); } catch (e) {} } }, 2000);
+  }, PLAY_MAX_S * 1000);
   p.on('error', function () {});
-  p.on('exit', function () { if (player.proc === p) playNext(); });
+  p.on('exit', function () { exited = true; clearTimeout(limit); if (player.proc === p) playNext(); });
 }
 function stopPlayback(silent) {
   player.queue = [];

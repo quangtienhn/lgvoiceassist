@@ -9,8 +9,8 @@ harness directory in $LGTV_HARNESS_DIR), e.g. a luna-send that answers, or a par
 What it fakes (all inside a private temp dir, nothing is written to /tmp/lgtv-assist.* or the TV paths):
   * `palmbus` (tools/daemon_harness/palmbus.js, on NODE_PATH); `d.luna_request(...)` plays in a request to a
     service the daemon registered (e.g. the mic button), `d.luna_responses()` / `d.luna_methods()` show the result
-  * luna-send / pactl / parec / amixer / mpg123 / gst-play-1.0 / timeout / ls-monitor / nyx-cmd: executables that
-    do nothing, first on PATH
+  * luna-send / pactl / parec / amixer / mpg123 / gst-play-1.0 / ls-monitor / nyx-cmd: executables that do nothing,
+    first on PATH
   * LGTV_ASSIST_DATA (settings.json) and LGTV_ASSIST_TMP (log, status, pid files)
   * UDP multicast: tools/daemon_harness/preload.js stops the mDNS responder from touching the network and
     records what it would have sent
@@ -29,7 +29,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SATELLITE = os.path.join(ROOT, "app", "daemon", "satellite.js")
-FAKE_TOOLS = ["luna-send", "pactl", "parec", "amixer", "mpg123", "gst-play-1.0", "timeout", "ls-monitor", "nyx-cmd"]
+FAKE_TOOLS = ["luna-send", "pactl", "parec", "amixer", "mpg123", "gst-play-1.0", "ls-monitor", "nyx-cmd"]
 
 
 def free_port():
